@@ -245,7 +245,7 @@ int main(int argc, char* argv[]){
     std::get<1>(sigs).push_back(big_sig);
     std::get<0>(sigs).push_back(std::vector<std::uint64_t>(256,1));
     std::get<2>(sigs)[625] = "/path/to/file/625.fasta";
-    auto full_hibf = generate_hibf<standardHasher>(sigs, lvls, s, 0.01, 4, refinements);
+    auto full_hibf = generate_hibf<standardHasher>(sigs, lvls, s, 0.01, 4, refinements,1);
     std::unordered_map<size_t, std::string>& seq_to_file = std::get<2>(sigs);
 
 

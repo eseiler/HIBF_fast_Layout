@@ -36,15 +36,12 @@ int main(int argc, char* argv[]){
     size_t refinements = std::stoul(argv[9]);
     const std::uint8_t hash_funcs = static_cast<std::uint8_t>(std::stoul(argv[10]));
     std::ofstream out_path(argv[11]);
-    size_t threads = std::stoul(argv[12]);
-        
+    size_t threads = std::stoul(argv[12]);  
     // Generate One Permutation Hashes for each "sequence":
     IntHasher hasher;
     std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std::uint64_t>>, std::unordered_map<size_t, std::string>> sigs = ophs_fmhs(dir_path, q, k, w, seed, s, hasher, threads);
-
-    auto full_hibf = generate_hibf<standardHasher>(sigs, lvls, s, fpr, hash_funcs, refinements);
+    auto full_hibf = generate_hibf<standardHasher>(sigs, lvls, s, fpr, hash_funcs, refinements, threads);
     std::unordered_map<size_t, std::string>& seq_to_file = std::get<2>(sigs);
-
 
     write_linkage(out_path, seq_to_file);
     write_config(out_path, dir_path, q, w, fpr, hash_funcs, seq_to_file.size());

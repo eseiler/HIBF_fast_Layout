@@ -1,9 +1,9 @@
 CXX = g++
-CXXFLAGS = -std=c++23 -I../seqan3/include -I../xxHash
-LDFLAGS = -llemon -lz -lbz2
+CXXFLAGS = -std=c++23 -O3 -march=native -DNDEBUG -fopenmp -flto -I../seqan3/include -I../xxHash
+LDFLAGS = -lz -lbz2
 SRC = ../code
 
-all: function_tests generate_clusters
+all: function_tests generate_clusters generate_layout
 
 function_tests: ${SRC}/fast_construct_test.cpp ${SRC}/fast_construct_hashing.cpp ${SRC}/fast_construct_graph.cpp ${SRC}/fast_construct_bin.cpp
 	${CXX} ${CXXFLAGS} $^ -o $@ $(LDFLAGS)

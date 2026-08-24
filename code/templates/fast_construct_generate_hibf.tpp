@@ -1,115 +1,174 @@
-#include "../fast_construct_bin.h"#
+#include "../fast_construct_bin.h"
 #include <future>
 #include <thread>
+#include <iostream>
+#include <numeric>
+#include <algorithm>
+#include <tuple>
+#include <vector>
+#include <unordered_map>
+#include <limits>
 
 template <typename Hasher>
-std::tuple<std::vector<std::vector<IBF>>, std::vector<std::vector<std::tuple<size_t,size_t,size_t>>>, std::unordered_map<size_t, std::vector<std::tuple<size_t,size_t,size_t>>>, std::vector<std::vector<size_t>>, std::vector<std::vector<std::pair<size_t,size_t>>>> generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std::uint64_t>>, std::unordered_map<size_t, std::string>>& signatures,
-                                            const std::vector<std::pair<size_t,size_t>>& levels,
-                                            const double s, const double fpr, const size_t h, const size_t p, const size_t threads){
+std::tuple<std::vector<std::vector<IBF>>, 
+           std::vector<std::vector<std::tuple<size_t,size_t,size_t>>>, 
+           std::unordered_map<size_t, std::vector<std::tuple<size_t,size_t,size_t>>>, 
+           std::vector<std::vector<size_t>>, 
+           std::vector<std::vector<std::pair<size_t,size_t>>>> 
+generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std::uint64_t>>, std::unordered_map<size_t, std::string>>& signatures,
+              const std::vector<std::pair<size_t,size_t>>& levels,
+              const double s, const double fpr, const size_t h, const size_t p, const size_t threads) {
+    
+    using BinResult = std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool>;
+    using ChildResult = BinResult;
 
     size_t max = std::numeric_limits<size_t>::max();
     const std::vector<std::vector<std::uint64_t>>& oph_sigs = std::get<0>(signatures);
     const std::vector<std::vector<std::uint64_t>>& fracmin_sigs = std::get<1>(signatures);
     const std::vector<double> fcorrs = compute_fcorrs(fpr, h);
-
-    std::unordered_map<size_t, std::vector<std::tuple<size_t,size_t,size_t>>> seq_layout; // We already want to store information according to Layout standards.
+    
+    std::unordered_map<size_t, std::vector<std::tuple<size_t,size_t,size_t>>> seq_layout;
     std::vector<std::vector<size_t>> max_bin_ids;
     std::vector<std::vector<std::pair<size_t,size_t>>> parents;
-
+    
     lemon::ListGraph graph;
     std::vector<std::unordered_map<std::vector<size_t>, lemon::ListGraph::Node, Hasher>> labMaps = generate_all<Hasher>(oph_sigs, levels, graph);
     std::vector<std::unordered_map<size_t, const std::vector<size_t>*>> clusts = get_clusters(labMaps);
+    
+auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size_t lower, size_t upper, bool all_seqs) {
+    bool valid = false;
+    std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> b_res;
+    std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> res;
+    size_t curr_lower = lower;
+    size_t curr_upper = upper;
+    size_t curr_t_max = (curr_lower + curr_upper)/(2*sub_bins*s);
+    size_t old_t_max = 0;
+    size_t best_t_max = curr_t_max;
 
-    auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size_t lower, size_t upper, bool all_seqs) {
-        bool valid = false;
-        std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> b_res;
-        std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> res;
-        size_t curr_lower = lower;
-        size_t curr_upper = upper;
-        size_t curr_t_max = (curr_lower + curr_upper)/(2*sub_bins*s);
-        size_t old_t_max = 0;
+    curr_upper = curr_t_max * 2;
+    curr_lower = 0;
 
-        curr_upper = curr_t_max * 2;
-        curr_lower = 0;
-
-        bool upper_overflow = false;
-
-        for(size_t it = 0; it <= p;){
-            res = all_seqs ? binning(labMaps, clusts, fracmin_sigs, s, sub_bins, curr_t_max, fcorrs) : binning_given_seqs(labMaps, clusts, fracmin_sigs, seqs, s, sub_bins, curr_t_max, fcorrs);
-
-            bool overflow = std::get<3>(res);
-            if(overflow){
-                upper_overflow = (curr_t_max == curr_upper);
-                curr_lower = curr_t_max;
-                if(curr_t_max == 0) break;
-                old_t_max = curr_t_max;
-                curr_t_max = (curr_lower + curr_upper)/2;
-                continue;
-            }
-            upper_overflow = false;
-            if(it == p) break; // Last iteration done
-
-            const auto& [split_start, split_bins, merge_start] = std::get<1>(res);
-            const std::vector<std::vector<size_t>>& result = std::get<0>(res);
-
-            valid = true;
-            b_res = res;
-
-            size_t split_bin_amt = merge_start - split_start;
-            size_t merge_bin_amt = result.size() - merge_start;
-
-            if(split_bin_amt == 0 && merge_bin_amt == 0) break; // can't refine  if the IBF is empty
-
-            const std::vector<size_t>& trackfill = std::get<2>(res);
-            size_t split_avg = split_bin_amt ? splitting_average(trackfill, split_start, merge_start) : 0;
-            size_t merge_avg = merge_bin_amt ? merge_average(trackfill, merge_start) : 0;
-
-            if (split_bin_amt == 0 || split_avg < merge_avg) {
-                curr_upper = curr_t_max;
-            } else {
-                curr_lower = curr_t_max;
-            }
-
-            if(curr_t_max == 0) break; // If t_max should get really small
-            old_t_max = curr_t_max;
-            curr_t_max = (curr_lower + curr_upper)/2;
-            it += 1;
-        }
-        if(valid) return b_res;
-        return res;
+    auto used_bin_count = [](const auto& res_tuple) {
+        const auto& ibf = std::get<0>(res_tuple);
+        size_t count = 0;
+        for (const auto& bin : ibf) if (!bin.empty()) count += 1;
+        return count;
     };
 
-    auto record_bins = [&](const IBF& result, size_t split_start, size_t merge_start, size_t index){
-        for(size_t b = split_start; b < merge_start;){
-            if(result[b].empty()){b += 1; continue;}
+    if (all_seqs) {
+        std::cerr << "[refine_and_bin] ROOT START: sub_bins = " << sub_bins
+                  << ", lower = " << lower << ", upper = " << upper
+                  << ", initial t_max = " << curr_t_max << "\n";
+    }
+
+    for(size_t it = 0; it <= p;){
+        if(curr_t_max == old_t_max) {
+            if (all_seqs) {
+                std::cerr << "[refine_and_bin] ROOT Convergence reached at it = " << it << " (t_max = " << curr_t_max << ")\n";
+            }
+            break; 
+        }
+
+        res = all_seqs ? binning(labMaps, clusts, fracmin_sigs, s, sub_bins, curr_t_max, fcorrs) 
+                       : binning_given_seqs(labMaps, clusts, fracmin_sigs, seqs, s, sub_bins, curr_t_max, fcorrs);
+
+        bool overflow = std::get<3>(res);
+        if(overflow){
+            if (all_seqs) {
+                std::cerr << "[refine_and_bin] ROOT OVERFLOW at t_max = " << curr_t_max << " (iteration not counted)\n";
+            }
+            curr_lower = curr_t_max;
+            if(curr_t_max == 0) break;
+
+            size_t next_t_max = (curr_lower + curr_upper) / 2;
+            if (next_t_max == curr_t_max) break; // Intervall lässt sich nicht weiter verkleinern
+
+            curr_t_max = next_t_max;
+            continue; 
+        }
+        if(it == p) break; 
+
+        const auto& [split_start, split_bins_cnt, merge_start] = std::get<1>(res);
+        const std::vector<std::vector<size_t>>& result = std::get<0>(res);
+
+        valid = true;
+        b_res = res;
+        best_t_max = curr_t_max; // Speichere das t_max des korrekten Ergebnisses
+
+        size_t split_bin_amt = merge_start - split_start;
+        size_t merge_bin_amt = result.size() - merge_start;
+
+        if(split_bin_amt == 0 && merge_bin_amt == 0) {
+            if (all_seqs) {
+                std::cerr << "[refine_and_bin] ROOT Empty IBF result, stopping refinement.\n";
+            }
+            break; 
+        }
+
+        const std::vector<size_t>& trackfill = std::get<2>(res);
+        size_t split_avg = split_bin_amt ? splitting_average(trackfill, split_start, merge_start) : 0;
+        size_t merge_avg = merge_bin_amt ? merge_average(trackfill, merge_start) : 0;
+
+        if (all_seqs) {
+            std::cerr << "[refine_and_bin] ROOT [it " << it << "] t_max = " << curr_t_max 
+                      << ", used_bins = " << used_bin_count(res)
+                      << ", split_avg = " << split_avg 
+                      << ", merge_avg = " << merge_avg << "\n";
+        }
+
+        if (split_bin_amt == 0 || split_avg < merge_avg) {
+            curr_upper = curr_t_max;
+        } else {
+            curr_lower = curr_t_max;
+        }
+
+        if(curr_t_max == 0) break; 
+        old_t_max = curr_t_max;    
+        curr_t_max = (curr_lower + curr_upper)/2;
+        it += 1;                   
+    }
+
+    bool final_is_overflow = std::get<3>(res);
+    auto final_res = (final_is_overflow && valid) ? b_res : res;
+    size_t chosen_t_max = (final_is_overflow && valid) ? best_t_max : curr_t_max;
+
+    if (all_seqs) {
+        std::cerr << "[refine_and_bin] ROOT END: chosen t_max = " << chosen_t_max
+                  << ", used_bins = " << used_bin_count(final_res)
+                  << ", overflow_flag = " << std::get<3>(final_res) << "\n";
+    }
+
+    return final_res;
+};
+
+    auto record_bins = [&](const IBF& result, size_t split_start, size_t merge_start, size_t index) {
+        for (size_t b = split_start; b < merge_start;) {
+            if (result[b].empty()) { b += 1; continue; }
             size_t seq = result[b][0];
             size_t start = b;
             size_t count = 0;
-            while(b < merge_start && !result[b].empty() && result[b][0] == seq){count += 1; b += 1;}
-            seq_layout[seq].push_back({index,start, count});
+            while (b < merge_start && !result[b].empty() && result[b][0] == seq) { count += 1; b += 1; }
+            seq_layout[seq].push_back({index, start, count});
         }
-
-        for(size_t b = merge_start; b < result.size(); b++){
-            for(size_t seq : result[b]) seq_layout[seq].push_back({index,b,1});
+        for (size_t b = merge_start; b < result.size(); b++) {
+            for (size_t seq : result[b]) seq_layout[seq].push_back({index, b, 1});
         }
     };
 
-    auto get_upper_lower = [&](const std::vector<size_t>& seqs, size_t sub_bins){
+    auto get_upper_lower = [&](const std::vector<size_t>& seqs, size_t sub_bins) {
         std::vector<const std::vector<std::uint64_t>*> ptrs;
         ptrs.reserve(seqs.size());
-        for(size_t seq : seqs) ptrs.push_back(&fracmin_sigs[seq]);
-
+        for (size_t seq : seqs) ptrs.push_back(&fracmin_sigs[seq]);
         size_t union_size = get_union_size_ptr(ptrs);
         size_t sum = 0;
-        for(size_t seq : seqs) sum += fracmin_sigs[seq].size();
-
+        for (size_t seq : seqs) sum += fracmin_sigs[seq].size();
         return std::pair{union_size, sum};
     };
 
-    auto get_sub_bins = [&](size_t N){
-        if(N == 0) return size_t{0};
+    auto get_sub_bins = [&](size_t N) {
+        if (N == 0) return size_t{0};
         double raw = std::sqrt(static_cast<double>(N));
-        size_t rounded = static_cast<size_t>(std::ceil(raw/64.0))*64; // round to nearest multiple of 64
+        size_t rounded = static_cast<size_t>(std::ceil(raw / 64.0)) * 64;
         if (rounded == 0) rounded = 64;
         return std::min(rounded, static_cast<size_t>(2000));
     };
