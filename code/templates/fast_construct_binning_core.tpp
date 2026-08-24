@@ -264,6 +264,46 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
 
     size_t allowed_merge = static_cast<size_t>(static_cast<double>(get_union_size_ptr(supersketch)) / (s * static_cast<double>(t_max)));
 
+        /// @note This is the Late Merging
+    /// After using Every cluster, we are left with our estimate usage of the Merge Bins.
+    /// We start by entering the "biggest" small cluster and itterate over every usable bin. The small clusters left are used in the Fallback Mechanism.
+    
+    size_t seeding_max_bin = (bins > allowed_merge) ? (bins - allowed_merge) : bins;
+    size_t empty_start = seeding_max_bin;
+    size_t empty_end = bins;
+
+    if (empty_start < empty_end) {
+        size_t available_merge_bins = empty_end - empty_start;
+        size_t merge_rr_idx = 0;
+
+        for (const std::vector<size_t>* cluster : small_clusters) {
+            for (size_t seq : *cluster) {
+                if (binned.count(seq)) continue;
+                size_t attempts = 0;
+                while (attempts < available_merge_bins) {
+                    size_t curr_bin = empty_start + (merge_rr_idx % available_merge_bins);
+                    merge_rr_idx++;
+                    attempts++;
+
+                    if (cluster_has_budget_for_bin(cluster, curr_bin)) {
+                        if (try_insert_sequence(seq, curr_bin, false)) {
+                            register_bin_for_cluster(cluster, curr_bin);
+
+                            for (size_t lvl = 0; lvl <= deepest_lvl; lvl++) {
+                                auto it = level_clusters[lvl].find(seq);
+                                if (it != level_clusters[lvl].end()) {
+                                    used_clusters_per_level[lvl].insert(it->second);
+                                    update_bin(lvl, it->second, curr_bin);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// @note This is the cluster Splitting
     /// If a cluster is too big on the bottom level, we call the helper function above and Round-Robin distribute them.
 
@@ -311,7 +351,7 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
         return a->front() < b->front();
     });
 
-    size_t seeding_max_bin = (bins > allowed_merge) ? (bins - allowed_merge) : bins;
+    
     size_t seeding_rr_bin = bin;
     size_t num_seeding_bins = seeding_max_bin - start;
 
@@ -391,46 +431,6 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
         if (track_fill[b] < t_max && curr_lvl > 0) {
             bin_lvls[b] -= 1;
             valid_bins.push(b);
-        }
-    }
-
-
-    /// @note This is the Late Merging
-    /// After using Every cluster, we are left with our estimate usage of the Merge Bins.
-    /// We start by entering the "biggest" small cluster and itterate over every usable bin. The small clusters left are used in the Fallback Mechanism.
-
-    size_t empty_start = seeding_max_bin;
-    size_t empty_end = bins;
-
-    if (empty_start < empty_end) {
-        size_t available_merge_bins = empty_end - empty_start;
-        size_t merge_rr_idx = 0;
-
-        for (const std::vector<size_t>* cluster : small_clusters) {
-            for (size_t seq : *cluster) {
-                if (binned.count(seq)) continue;
-                size_t attempts = 0;
-                while (attempts < available_merge_bins) {
-                    size_t curr_bin = empty_start + (merge_rr_idx % available_merge_bins);
-                    merge_rr_idx++;
-                    attempts++;
-
-                    if (cluster_has_budget_for_bin(cluster, curr_bin)) {
-                        if (try_insert_sequence(seq, curr_bin, false)) {
-                            register_bin_for_cluster(cluster, curr_bin);
-
-                            for (size_t lvl = 0; lvl <= deepest_lvl; lvl++) {
-                                auto it = level_clusters[lvl].find(seq);
-                                if (it != level_clusters[lvl].end()) {
-                                    used_clusters_per_level[lvl].insert(it->second);
-                                    update_bin(lvl, it->second, curr_bin);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
         }
     }
 
