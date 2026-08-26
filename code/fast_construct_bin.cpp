@@ -19,7 +19,7 @@ size_t merge_average(const std::vector<size_t>& track_fill, const size_t merge_s
     for(size_t b = merge_start; b < track_fill.size(); b++){
         if(track_fill[b] == 0) continue;
         sum += track_fill[b];
-        amount += 1;  
+        amount += 1;
     }
     return amount ? sum / amount : 0;
 }
@@ -37,10 +37,10 @@ size_t splitting_average(const std::vector<size_t>& track_fill, const size_t spl
 
 void write_linkage(std::ostream& out, const std::unordered_map<size_t, std::string>& seq_to_path){
     out << "@CHOPPER_USER_BINS\n";
-    for(auto& [seq, path] : seq_to_path){
-        out << "@" << seq << " " << path << "\n";
+    for(size_t i = 0; i < seq_to_path.size(); ++i){
+        out << "@" << i << " " << seq_to_path.at(i) << '\n';
     }
-    out << "@CHOPPER_USER_BINS_END";
+    out << "@CHOPPER_USER_BINS_END\n";
 }
 
 void write_config(std::ofstream& out,
@@ -121,7 +121,7 @@ void write_header(std::ostream& out, const std::vector<std::vector<IBF>>& hibf_l
             if(level == 0) out << "#TOP_LEVEL_IBF fullest_technical_bin_idx:" << max_bin_id << "\n";
             else{
                 std::string const label = merge_bin_label(level, ibf_idx, parents);
-                out << "#LOWER_LEVEL_IBF_" << label << " fullest_technical_bin_idx" << max_bin_id << "\n";
+                out << "#LOWER_LEVEL_IBF_" << label << " fullest_technical_bin_idx:" << max_bin_id << "\n";
             }
         }
     }
@@ -130,7 +130,8 @@ void write_header(std::ostream& out, const std::vector<std::vector<IBF>>& hibf_l
 }
 
 void write_content(std::ofstream& out, const std::unordered_map<size_t, std::vector<std::tuple<size_t,size_t,size_t>>>& seq_layout){
-    for(auto const& [seq, entries] : seq_layout){
+    for(size_t seq = 0; seq < seq_layout.size(); ++seq){
+        auto const & entries = seq_layout.at(seq);
         std::string bin_indices;
         std::string number_of_bins;
 

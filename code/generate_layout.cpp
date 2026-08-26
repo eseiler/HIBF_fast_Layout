@@ -20,8 +20,10 @@ std::vector<std::pair<size_t,size_t>> parse_lvls(const std::string& s){
 }
 
 int main(int argc, char* argv[]){
-    if(argc != 13){
-        std::cerr << "Missing parameters: " << "Levels used for LSH + Fraction s for Fracmin. + Refinement count when constructing the HIBF + Max Levels of HIBF\n";
+    if(argc != 13 && argc != 14){
+        std::cerr << "Usage: " << argv[0] << " <dir> <k> <q> <w> <seed> <fpr> <lvls> <s> <refinements> <hash_funcs> <out> <threads> [sketch_cache]\n"
+                  << "  sketch_cache : optional file the sketches are cached in. Hashing the input is by far\n"
+                  << "                 the slowest step, so reusing it makes repeated runs on the same data fast.\n";
         return 1;
     }
 
@@ -36,10 +38,26 @@ int main(int argc, char* argv[]){
     size_t refinements = std::stoul(argv[9]);
     const std::uint8_t hash_funcs = static_cast<std::uint8_t>(std::stoul(argv[10]));
     std::ofstream out_path(argv[11]);
-    size_t threads = std::stoul(argv[12]);  
+    size_t threads = std::stoul(argv[12]);
+    const std::filesystem::path cache_path = (argc == 14) ? std::filesystem::path{argv[13]} : std::filesystem::path{};
+
     // Generate One Permutation Hashes for each "sequence":
     IntHasher hasher;
-    std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std::uint64_t>>, std::unordered_map<size_t, std::string>> sigs = ophs_fmhs(dir_path, q, k, w, seed, s, hasher, threads);
+    const SketchParams sketch_params{dir_path, q, k, w, seed, s};
+    SketchSet sigs;
+
+    if(read_sketch_cache(cache_path, sketch_params, sigs)){
+        std::cerr << "[sketch cache] read " << std::get<1>(sigs).size() << " sketches from " << cache_path.string() << "\n";
+    }
+    else{
+        sigs = ophs_fmhs(dir_path, q, k, w, seed, s, hasher, threads);
+        if(!cache_path.empty()){
+            if(write_sketch_cache(cache_path, sketch_params, sigs))
+                std::cerr << "[sketch cache] wrote " << std::get<1>(sigs).size() << " sketches to " << cache_path.string() << "\n";
+            else
+                std::cerr << "[sketch cache] could not write " << cache_path.string() << "\n";
+        }
+    }
     auto full_hibf = generate_hibf<standardHasher>(sigs, lvls, s, fpr, hash_funcs, refinements, threads);
     std::unordered_map<size_t, std::string>& seq_to_file = std::get<2>(sigs);
 

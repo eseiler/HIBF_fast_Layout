@@ -57,6 +57,10 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
 
     auto try_insert_sequence = [&](size_t seq, size_t b, bool force) {
         if (b >= bins) return false;
+        // A bin holding more than one sequence becomes a merge bin, i.e. a whole IBF on the level
+        // below, and that child gets the same number of technical bins as this one. Letting a bin
+        // grow past that guarantees the child has to merge again.
+        if (!force && res[b].size() >= bins) return false;
         std::unordered_set<std::uint64_t>& sketch = bin_sketches[b];
         std::vector<std::uint64_t> new_elems;
         for (std::uint64_t elem : fracmin_sketches[seq])if (!sketch.count(elem)) new_elems.push_back(elem);

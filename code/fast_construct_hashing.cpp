@@ -1,6 +1,9 @@
 #include "fast_construct_hashing.h"
 #include <limits>
 #include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iostream>
 #include <seqan3/search/views/kmer_hash.hpp>
 #include <seqan3/alphabet/nucleotide/dna5.hpp>
 #include <seqan3/io/sequence_file/all.hpp>
@@ -44,6 +47,127 @@ std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std:
   return {std::move(res_oph), std::move(res_fracmin), std::move(seq_to_path)};
 }
 
+
+namespace {
+
+constexpr char sketch_cache_magic[8] = {'F','L','S','K','C','H','0','1'};
+
+template <typename T>
+void put(std::ostream& out, const T& value){ out.write(reinterpret_cast<const char*>(&value), sizeof(T)); }
+
+template <typename T>
+bool get(std::istream& in, T& value){ return static_cast<bool>(in.read(reinterpret_cast<char*>(&value), sizeof(T))); }
+
+void put_sketches(std::ostream& out, const std::vector<std::vector<std::uint64_t>>& sketches){
+    put(out, static_cast<std::uint64_t>(sketches.size()));
+    for(const std::vector<std::uint64_t>& sketch : sketches){
+        put(out, static_cast<std::uint64_t>(sketch.size()));
+        if(!sketch.empty()) out.write(reinterpret_cast<const char*>(sketch.data()), sketch.size() * sizeof(std::uint64_t));
+    }
+}
+
+bool get_sketches(std::istream& in, std::vector<std::vector<std::uint64_t>>& sketches, std::uint64_t expected){
+    std::uint64_t count = 0;
+    if(!get(in, count) || count != expected) return false;
+    sketches.assign(count, {});
+    for(std::vector<std::uint64_t>& sketch : sketches){
+        std::uint64_t len = 0;
+        if(!get(in, len)) return false;
+        sketch.resize(len);
+        if(len && !in.read(reinterpret_cast<char*>(sketch.data()), len * sizeof(std::uint64_t))) return false;
+    }
+    return true;
+}
+
+void put_string(std::ostream& out, const std::string& str){
+    put(out, static_cast<std::uint64_t>(str.size()));
+    if(!str.empty()) out.write(str.data(), str.size());
+}
+
+bool get_string(std::istream& in, std::string& str){
+    std::uint64_t len = 0;
+    if(!get(in, len)) return false;
+    str.resize(len);
+    if(len && !in.read(str.data(), len)) return false;
+    return true;
+}
+
+} // namespace
+
+bool write_sketch_cache(const std::filesystem::path& path, const SketchParams& params, const SketchSet& sketches){
+    std::ofstream out(path, std::ios::binary);
+    if(!out) return false;
+
+    out.write(sketch_cache_magic, sizeof(sketch_cache_magic));
+    put(out, params.q);
+    put(out, params.k);
+    put(out, params.w);
+    put(out, params.seed);
+    put(out, params.s);
+    put_string(out, params.dir_path.string());
+
+    const std::vector<std::vector<std::uint64_t>>& oph = std::get<0>(sketches);
+    const std::vector<std::vector<std::uint64_t>>& fmh = std::get<1>(sketches);
+    const std::unordered_map<size_t, std::string>& paths = std::get<2>(sketches);
+
+    put(out, static_cast<std::uint64_t>(oph.size()));
+    put_sketches(out, oph);
+    put_sketches(out, fmh);
+
+    put(out, static_cast<std::uint64_t>(paths.size()));
+    for(const auto& [seq_id, file] : paths){
+        put(out, static_cast<std::uint64_t>(seq_id));
+        put_string(out, file);
+    }
+
+    out.flush();
+    return static_cast<bool>(out);
+}
+
+bool read_sketch_cache(const std::filesystem::path& path, const SketchParams& params, SketchSet& out_sketches){
+    if(path.empty()) return false;
+
+    std::ifstream in(path, std::ios::binary);
+    if(!in) return false;
+
+    char magic[sizeof(sketch_cache_magic)] = {};
+    if(!in.read(magic, sizeof(magic)) || std::memcmp(magic, sketch_cache_magic, sizeof(magic)) != 0){
+        std::cerr << "[sketch cache] " << path.string() << " is not a sketch cache, recomputing\n";
+        return false;
+    }
+
+    std::uint8_t q = 0, k = 0;
+    std::uint32_t w = 0;
+    std::uint64_t seed = 0;
+    double s = 0.0;
+    std::string dir;
+    if(!get(in, q) || !get(in, k) || !get(in, w) || !get(in, seed) || !get(in, s) || !get_string(in, dir)) return false;
+
+    if(q != params.q || k != params.k || w != params.w || seed != params.seed || s != params.s || dir != params.dir_path.string()){
+        std::cerr << "[sketch cache] " << path.string() << " was written with different parameters, recomputing\n";
+        return false;
+    }
+
+    std::uint64_t count = 0;
+    if(!get(in, count)) return false;
+
+    SketchSet loaded;
+    if(!get_sketches(in, std::get<0>(loaded), count)) return false;
+    if(!get_sketches(in, std::get<1>(loaded), count)) return false;
+
+    std::uint64_t path_count = 0;
+    if(!get(in, path_count)) return false;
+    std::get<2>(loaded).reserve(path_count);
+    for(std::uint64_t i = 0; i < path_count; i++){
+        std::uint64_t seq_id = 0;
+        std::string file;
+        if(!get(in, seq_id) || !get_string(in, file)) return false;
+        std::get<2>(loaded).emplace(static_cast<size_t>(seq_id), std::move(file));
+    }
+
+    out_sketches = std::move(loaded);
+    return true;
+}
 
 size_t get_union_size(const std::vector<std::vector<std::uint64_t>>& sketches){
   std::unordered_set<std::uint64_t> elems;

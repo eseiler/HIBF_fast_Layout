@@ -6,6 +6,9 @@
 #include <filesystem>
 #include <utility>
 #include <algorithm>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -48,6 +51,39 @@ template <typename IntHash>
 std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std::uint64_t>>, std::unordered_map<size_t, std::string>> ophs_fmhs(const std::filesystem::path& filepath,
                                               const std::uint8_t q, const std::uint8_t k, const std::uint32_t w, const std::uint64_t seed, const double s, IntHash&& hashFunc, const size_t threads);
 #include "templates/ophs_fmhs.tpp"
+
+// @brief What ophs_fmhs returns: the One Permutation Hashes, the Fracmin sketches, and the mapping
+//        from sequence id to the file it was read from.
+using SketchSet = std::tuple<std::vector<std::vector<std::uint64_t>>,
+                             std::vector<std::vector<std::uint64_t>>,
+                             std::unordered_map<size_t, std::string>>;
+
+// @brief The parameters the sketches depend on. A cache written with different ones is not reusable.
+struct SketchParams {
+    std::filesystem::path dir_path;
+    std::uint8_t q;
+    std::uint8_t k;
+    std::uint32_t w;
+    std::uint64_t seed;
+    double s;
+};
+
+// @brief Read sketches back from a cache file written by @func write_sketch_cache.
+// @param path : the cache file.
+// @param params : the parameters the caller is about to compute with.
+// @param out : filled with the cached sketches on success, untouched otherwise.
+// @return true when the file exists, is intact, and was written with exactly these parameters.
+//
+// @note hashing a directory of FASTA files is by far the slowest part of a layout run, so during
+//       testing the same sketches can be reused across many layout runs.
+bool read_sketch_cache(const std::filesystem::path& path, const SketchParams& params, SketchSet& out);
+
+// @brief Write sketches to a cache file, together with the parameters they were computed with.
+// @param path : the cache file, overwritten if it exists.
+// @param params : the parameters the sketches were computed with.
+// @param sketches : the sketches to store.
+// @return true when the file was written completely.
+bool write_sketch_cache(const std::filesystem::path& path, const SketchParams& params, const SketchSet& sketches);
 
 // @brief Given a set of (sorted) Fracmin Sketches, compute the size of the union of those sketches,
 // @param sketches : The set of Fracmin Sketches.

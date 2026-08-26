@@ -35,110 +35,145 @@ generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vec
     std::vector<std::unordered_map<std::vector<size_t>, lemon::ListGraph::Node, Hasher>> labMaps = generate_all<Hasher>(oph_sigs, levels, graph);
     std::vector<std::unordered_map<size_t, const std::vector<size_t>*>> clusts = get_clusters(labMaps);
     
-auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size_t lower, size_t upper, bool all_seqs) {
-    bool valid = false;
-    std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> b_res;
-    std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> res;
-    size_t curr_lower = lower;
-    size_t curr_upper = upper;
-    size_t curr_t_max = (curr_lower + curr_upper)/(2*sub_bins*s);
-    size_t old_t_max = 0;
-    size_t best_t_max = curr_t_max;
-
-    curr_upper = curr_t_max * 2;
-    curr_lower = 0;
-
-    auto used_bin_count = [](const auto& res_tuple) {
-        const auto& ibf = std::get<0>(res_tuple);
-        size_t count = 0;
-        for (const auto& bin : ibf) if (!bin.empty()) count += 1;
-        return count;
+    // Estimated cost of a layout, in k-mers. An IBF allocates all of its technical bins at the size
+    // of the fullest one, and every merge bin turns into a whole additional IBF one level down.
+    auto layout_cost = [](const BinResult& r, size_t sub_bins) {
+        const std::vector<std::vector<size_t>>& result = std::get<0>(r);
+        const std::vector<size_t>& fill = std::get<2>(r);
+        const size_t merge_start = std::get<2>(std::get<1>(r));
+        size_t max_fill = 0;
+        for (size_t f : fill) max_fill = std::max(max_fill, f);
+        size_t child_content = 0;
+        for (size_t b = merge_start; b < result.size(); b++) if (!result[b].empty()) child_content += fill[b];
+        return static_cast<double>(sub_bins) * static_cast<double>(max_fill) + static_cast<double>(child_content);
     };
 
-    if (all_seqs) {
-        std::cerr << "[refine_and_bin] ROOT START: sub_bins = " << sub_bins
-                  << ", lower = " << lower << ", upper = " << upper
-                  << ", initial t_max = " << curr_t_max << "\n";
+    // A merge bin holding every sequence the IBF was given would produce a child IBF with the
+    // identical input, and generate_hibf would recurse on it forever. Requiring every merge bin to
+    // be strictly smaller than the input makes the recursion depth finite by construction.
+    auto makes_progress = [](const BinResult& r, size_t n_seqs) {
+        const std::vector<std::vector<size_t>>& result = std::get<0>(r);
+        const size_t merge_start = std::get<2>(std::get<1>(r));
+        for (size_t b = merge_start; b < result.size(); b++) if (result[b].size() >= n_seqs) return false;
+        return true;
+    };
+
+    // Last resort for when no t_max produced a usable layout: one user bin per technical bin for as
+    // long as they fit, round robin afterwards. Always a valid layout, and never puts every sequence
+    // into a single bin, so it always makes progress.
+    auto fallback_layout = [&](const std::vector<size_t>& seqs, size_t sub_bins) -> BinResult {
+        std::vector<std::vector<size_t>> res(sub_bins);
+        std::vector<size_t> fill(sub_bins, 0);
+        for (size_t i = 0; i < seqs.size(); i++) res[i % sub_bins].push_back(seqs[i]);
+
+        for (size_t b = 0; b < sub_bins; b++) {
+            if (res[b].empty()) continue;
+            std::vector<const std::vector<std::uint64_t>*> ptrs;
+            ptrs.reserve(res[b].size());
+            for (size_t seq : res[b]) ptrs.push_back(&fracmin_sigs[seq]);
+            fill[b] = static_cast<size_t>(static_cast<double>(get_union_size_ptr(ptrs)) / s);
+        }
+
+        // binning_core orders its bins empty first, then split bins, then merge bins; keep that.
+        std::vector<size_t> permutation(sub_bins);
+        std::iota(permutation.begin(), permutation.end(), 0);
+        std::sort(permutation.begin(), permutation.end(), [&res](size_t a, size_t b) {
+            if (res[a].size() != res[b].size()) return res[a].size() < res[b].size();
+            if (res[a].empty()) return false;
+            if (res[b].empty()) return true;
+            return res[a].front() < res[b].front();
+        });
+
+        std::vector<std::vector<size_t>> sorted_res(sub_bins);
+        std::vector<size_t> sorted_fill(sub_bins);
+        for (size_t i = 0; i < sub_bins; i++) {
+            sorted_res[i] = std::move(res[permutation[i]]);
+            sorted_fill[i] = fill[permutation[i]];
+        }
+
+        size_t split_start = 0;
+        while (split_start < sub_bins && sorted_res[split_start].empty()) split_start += 1;
+        size_t merge_start = split_start;
+        while (merge_start < sub_bins && sorted_res[merge_start].size() < 2) merge_start += 1;
+
+        return {std::move(sorted_res), std::make_tuple(split_start, size_t{0}, merge_start), std::move(sorted_fill), false};
+    };
+
+auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size_t lower, size_t upper, bool all_seqs) -> BinResult {
+    if (sub_bins == 0) return BinResult{{}, std::make_tuple(size_t{0}, size_t{0}, size_t{0}), {}, false};
+
+    const size_t n_seqs = all_seqs ? fracmin_sigs.size() : seqs.size();
+
+    // Every sequence at least this big gets split across several technical bins, so above this t_max
+    // nothing is split at all and binning cannot run out of bins. Keeping it inside the search
+    // interval guarantees a non-overflowing t_max is always reachable, whatever the interval derived
+    // from the content happens to be.
+    size_t max_single = 0;
+    if (all_seqs)
+        for (const std::vector<std::uint64_t>& sketch : fracmin_sigs)
+            max_single = std::max(max_single, static_cast<size_t>(static_cast<double>(sketch.size()) / s));
+    else
+        for (size_t seq : seqs)
+            max_single = std::max(max_single, static_cast<size_t>(static_cast<double>(fracmin_sigs[seq].size()) / s));
+    const size_t feasible_t_max = max_single + max_single/16 + 1;
+
+    size_t curr_t_max = (lower + upper)/(2*sub_bins*s);
+    size_t curr_upper = std::max(curr_t_max * 2, feasible_t_max);
+    size_t curr_lower = 0;
+    size_t old_t_max = 0;
+
+    auto run = [&](size_t t_max) {
+        return all_seqs ? binning(labMaps, clusts, fracmin_sigs, s, sub_bins, t_max, fcorrs)
+                        : binning_given_seqs(labMaps, clusts, fracmin_sigs, seqs, s, sub_bins, t_max, fcorrs);
+    };
+
+    BinResult best;
+    bool valid = false;
+    double best_cost = 0.0;
+
+    auto consider = [&](const BinResult& r) {
+        if (std::get<3>(r)) return;                    // overflowed, so this is not a layout
+        if (!makes_progress(r, n_seqs)) return;        // would hand a child its own input
+        const double cost = layout_cost(r, sub_bins);
+        if (!valid || cost < best_cost) { best = r; best_cost = cost; valid = true; }
+    };
+
+    for (size_t it = 0; it <= p;) {
+        if (curr_t_max == old_t_max) break;
+
+        BinResult res = run(curr_t_max);
+        const bool overflow = std::get<3>(res);
+        consider(res);
+
+        // Overflow means t_max was too small to fit the split sequences. Anything else means the
+        // layout fits, and a smaller t_max makes every technical bin cheaper, so the search always
+        // walks towards the smallest t_max that still yields a layout.
+        if (overflow) curr_lower = curr_t_max;
+        else          curr_upper = curr_t_max;
+
+        old_t_max = curr_t_max;
+        const size_t next_t_max = (curr_lower + curr_upper)/2;
+        if (next_t_max == curr_t_max) break;
+        curr_t_max = next_t_max;
+        if (!overflow) it += 1;   // only count refinement steps that produced a layout
     }
 
-    for(size_t it = 0; it <= p;){
-        if(curr_t_max == old_t_max) {
-            if (all_seqs) {
-                std::cerr << "[refine_and_bin] ROOT Convergence reached at it = " << it << " (t_max = " << curr_t_max << ")\n";
-            }
-            break; 
-        }
-
-        res = all_seqs ? binning(labMaps, clusts, fracmin_sigs, s, sub_bins, curr_t_max, fcorrs) 
-                       : binning_given_seqs(labMaps, clusts, fracmin_sigs, seqs, s, sub_bins, curr_t_max, fcorrs);
-
-        bool overflow = std::get<3>(res);
-        if(overflow){
-            if (all_seqs) {
-                std::cerr << "[refine_and_bin] ROOT OVERFLOW at t_max = " << curr_t_max << " (iteration not counted)\n";
-            }
-            curr_lower = curr_t_max;
-            if(curr_t_max == 0) break;
-
-            size_t next_t_max = (curr_lower + curr_upper) / 2;
-            if (next_t_max == curr_t_max) break; // Intervall lässt sich nicht weiter verkleinern
-
-            curr_t_max = next_t_max;
-            continue; 
-        }
-        if(it == p) break; 
-
-        const auto& [split_start, split_bins_cnt, merge_start] = std::get<1>(res);
-        const std::vector<std::vector<size_t>>& result = std::get<0>(res);
-
-        valid = true;
-        b_res = res;
-        best_t_max = curr_t_max; // Speichere das t_max des korrekten Ergebnisses
-
-        size_t split_bin_amt = merge_start - split_start;
-        size_t merge_bin_amt = result.size() - merge_start;
-
-        if(split_bin_amt == 0 && merge_bin_amt == 0) {
-            if (all_seqs) {
-                std::cerr << "[refine_and_bin] ROOT Empty IBF result, stopping refinement.\n";
-            }
-            break; 
-        }
-
-        const std::vector<size_t>& trackfill = std::get<2>(res);
-        size_t split_avg = split_bin_amt ? splitting_average(trackfill, split_start, merge_start) : 0;
-        size_t merge_avg = merge_bin_amt ? merge_average(trackfill, merge_start) : 0;
-
+    // Nothing usable yet: try the t_max that cannot overflow by construction, then fall back.
+    // Returning binning_core's overflow result is never an option - its ranges are {0,0,0}, which
+    // makes every single technical bin a lower level IBF, and its bins hold only the sequences that
+    // were placed before it ran out of room.
+    if (!valid) consider(run(feasible_t_max));
+    if (!valid) {
         if (all_seqs) {
-            std::cerr << "[refine_and_bin] ROOT [it " << it << "] t_max = " << curr_t_max 
-                      << ", used_bins = " << used_bin_count(res)
-                      << ", split_avg = " << split_avg 
-                      << ", merge_avg = " << merge_avg << "\n";
-        }
-
-        if (split_bin_amt == 0 || split_avg < merge_avg) {
-            curr_upper = curr_t_max;
+            std::vector<size_t> all_ids(fracmin_sigs.size());
+            std::iota(all_ids.begin(), all_ids.end(), 0);
+            best = fallback_layout(all_ids, sub_bins);
         } else {
-            curr_lower = curr_t_max;
+            best = fallback_layout(seqs, sub_bins);
         }
-
-        if(curr_t_max == 0) break; 
-        old_t_max = curr_t_max;    
-        curr_t_max = (curr_lower + curr_upper)/2;
-        it += 1;                   
     }
 
-    bool final_is_overflow = std::get<3>(res);
-    auto final_res = (final_is_overflow && valid) ? b_res : res;
-    size_t chosen_t_max = (final_is_overflow && valid) ? best_t_max : curr_t_max;
-
-    if (all_seqs) {
-        std::cerr << "[refine_and_bin] ROOT END: chosen t_max = " << chosen_t_max
-                  << ", used_bins = " << used_bin_count(final_res)
-                  << ", overflow_flag = " << std::get<3>(final_res) << "\n";
-    }
-
-    return final_res;
+    return best;
 };
 
     auto record_bins = [&](const IBF& result, size_t split_start, size_t merge_start, size_t index) {
@@ -215,6 +250,9 @@ auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size
                 tasks.push_back({ibf_index, b});
             }
         }
+
+        std::cerr << "[hibf] level " << lvl << ": " << hibf_levels[lvl].size()
+                  << " IBF(s), " << tasks.size() << " merge bin(s) to expand\n";
 
         if (tasks.empty()) break;
 
