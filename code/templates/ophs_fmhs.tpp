@@ -18,18 +18,18 @@ std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std:
         auto const& filepath = entry.path();
         auto ext = filepath.extension().string();
 
-        if(ext != ".fa" && ext != ".fasta" && ext !=".fna" && ext != ".fq" && ext !=".fastq") continue;
+        if(ext != ".fa" && ext != ".fasta" && ext !=".gz" && ext != ".fq" && ext !=".fastq") continue;
 
         files.push_back(filepath);
     }
- 
+
 
     const size_t n_threads = (threads > files.size()) ? files.size() : threads;
- 
+
     std::vector<std::vector<std::uint64_t>> res_oph(files.size());
     std::vector<std::vector<std::uint64_t>> res_fmh(files.size());
     std::vector<std::string> seq_paths(files.size());
- 
+
     std::atomic<std::size_t> next_file{0};
 
     auto worker = [&](){
@@ -48,12 +48,12 @@ std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std:
             std::vector<std::uint64_t> tmp_fracmin;
             for(auto&& qgram : record.sequence() | minimiser_view){
               std::uint64_t hash = hashFunc(qgram);
-          
+
               if(hash < thresh) tmp_fracmin.push_back(hash);
-          
+
               std::uint8_t index = hash & ((1ULL << k) -1);
               std::uint64_t val = hash >> k; // remove the k bits, they'd just be a bias since every value in the bucket would ALWAYS have these bits same.
-          
+
               if(val < tmp_oph[index]) tmp_oph[index] = val;
             }
           std::sort(tmp_fracmin.begin(), tmp_fracmin.end());
@@ -70,7 +70,7 @@ std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std:
         workers.emplace_back(worker);
     }
     for(auto& worker : workers) worker.join();
-    
+
 
     std::unordered_map<size_t, std::string> seq_to_path;
     seq_to_path.reserve(files.size());
@@ -78,6 +78,6 @@ std::tuple<std::vector<std::vector<std::uint64_t>>, std::vector<std::vector<std:
     for(size_t seq_id = 0; seq_id < files.size(); seq_id++){
         seq_to_path.emplace(seq_id, std::move(seq_paths[seq_id]));
     }
- 
+
  return {std::move(res_oph), std::move(res_fmh), std::move(seq_to_path)};
   }
