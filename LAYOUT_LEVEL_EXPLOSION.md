@@ -1,7 +1,12 @@
-# Why the fast layout produced far too many lower-level IBFs
+# Two failures in the fast layout, diagnosed and fixed
 
-Diagnosis of `generate_layout` at commit `adb502a` (source unchanged since `4fa995e`), and the
-fix, which is commit `a0af981`.
+Two separate investigations of `generate_layout`:
+
+1. **Too many lower-level IBFs** on the simulated `hibf_paper_lsh` data — diagnosed at commit
+   `adb502a`, fixed in `a0af981`.
+2. **A run that never finished** on RefSeq (25 321 gzipped genomes) — fixed in `901822a`.
+
+The first is sections 1-9 below, the second is *RefSeq: a different failure*.
 
 ## Result
 
@@ -369,6 +374,121 @@ against chopper's parser, and all three are in `code/fast_construct_bin.cpp`.
 The third one means any layout produced before `a0af981` had scrambled user bin to file
 assignments, which is worth knowing before comparing against older benchmark numbers.
 
+## RefSeq: a different failure
+
+The same binary, pointed at `/srv/data/datasets/RefSeq/28_01_2022/` (25 321 gzipped genomes),
+produced no output at all and was terminated after 20 minutes. With the sketch cache the input
+hashing is skipped entirely, so all of that time was the layout itself.
+
+What makes RefSeq different from the simulated data:
+
+| | simulated 16384 | RefSeq |
+|---|---:|---:|
+| user bins | 16384 | 25321 |
+| LSH top-level clusters | 256 | 7021 |
+| technical bins (`global_bins`) | 128 | 192 |
+| clusters per technical bin | 2 | 37 |
+| sequence sizes | uniform | highly variable |
+
+The simulated data is 64 near-duplicates per genome, so almost every insertion is accepted on
+the first attempt. RefSeq is genuinely diverse, so almost every attempt is *rejected* — and the
+rejection path turned out to be where all the cost and both latent bugs were.
+
+### Finding 1 — a rejected insertion cost a full sketch scan, thrown away
+
+`try_insert_sequence` probed the bin's hash set once per element of the sequence's sketch,
+computed the union size, and only then decided whether the bin could take it. On rejection all
+of that work was discarded, and seeding, late merging and the fallback each offer the same
+sequence to up to `bins` bins in turn, so the cost was
+`O(n_seqs * bins * |sketch|)` hash probes.
+
+Instrumented, one root binning call at `t_max = 151 249 359`:
+
+```
+[bc] nseq=25321 bins=192 t_max=151249359 clust=7021 | ... fallback=68501ms TOTAL=76044ms
+     try=1391818 rej_tmax=253345 lookups=1073.8M
+```
+
+**1.07 billion** hash probes in a single pass, 68 s of it in the fallback alone, repeated for
+every `t_max` the refinement tried.
+
+Fixed at `code/templates/fast_construct_binning_core.tpp:68-85` with two exact checks: the
+union can never be smaller than either side, which rejects a full bin without touching the hash
+table at all, and the loop stops as soon as the running union is known to exceed `t_max`
+instead of probing the rest of the sketch. Neither changes which insertions are accepted.
+
+### Finding 2 — work that does not depend on `t_max` was redone for every `t_max`
+
+Two things were recomputed on each of the six refinement passes even though neither depends on
+`t_max`:
+
+* the estimated size of every top level cluster (7021 `get_union_size_ptr` calls, 2.1 s per
+  pass), now cached per IBF via an optional parameter
+  (`code/templates/fast_construct_binning_core.tpp:216`, cache owned at
+  `code/templates/fast_construct_generate_hibf.tpp:137`);
+* for child IBFs, `filter_LSH` over the entire LSH forest — 33 569 clusters across four levels —
+  now hoisted to run once per IBF at
+  `code/templates/fast_construct_generate_hibf.tpp:132`.
+
+The cache is visible in the trace: `top=2119ms` on the first pass, `top=1ms` on the five after
+it.
+
+### Finding 3 — an unsigned underflow that spins ~2^64 times
+
+```cpp
+size_t num_seeding_bins = seeding_max_bin - start;
+```
+
+Late merging reserves the tail of the bin range and splitting consumes the head, so the seeding
+window can be empty: `start` exceeds `seeding_max_bin` and this subtraction wraps to about
+1.8e19. The seeding loop below it then spins essentially forever on cheap operations, which is
+why the process looked like it was making progress at 100% CPU with nothing to show.
+
+It fired **268 times** in one RefSeq run, e.g. `start=192 seeding_max_bin=191 bins=192` — off by
+a single bin. The symptom was one child IBF spinning while its 191 siblings each finished in
+0.5 s.
+
+This is pre-existing, unchanged since at least `4fa995e`; the simulated data never produced an
+empty seeding window. Fixed by clamping to 0 at
+`code/templates/fast_construct_binning_core.tpp:396`.
+
+### Finding 4 — an out of bounds read that silently dropped user bins
+
+The fallback's last resort branch picked the emptiest bin starting from `start`:
+
+```cpp
+size_t best_b = start;
+size_t best_fill = track_fill[start];   // start == bins reads past the end
+...
+try_insert_sequence(seq, best_b, true); // and this rejects b >= bins, so nothing is placed
+```
+
+When late merging had claimed every bin from `start` on, `start == bins`: the read is out of
+bounds and the insertion silently fails, so the sequence never reached the child IBF. It still
+had a root level entry pointing at the merge bin it came from, so those user bins ended up
+claiming technical bins that belonged to other user bins — 342 of them in the RefSeq layout,
+each one a corrupt entry rather than a missing one.
+
+Also pre-existing. Fixed at `code/templates/fast_construct_binning_core.tpp:536-537`: retry over
+the bins outside the split region, and report overflow if splitting claimed all of them, which
+the `t_max` search then resolves. The merge window is clamped the same way at
+`code/templates/fast_construct_binning_core.tpp:308` — bins below `merge_bins` hold pieces of
+split sequences, and `record_bins` needs those to stay a contiguous run of one-sequence bins.
+(A first attempt that simply searched from bin 0 traded the dropped user bins for 153 impossible
+four-level paths, which is what surfaced that constraint.)
+
+### Result
+
+| | before | after |
+|---|---|---|
+| RefSeq, 25 321 genomes | terminated after 20 min, no output | **158 s** |
+
+Structure: 1 + 192 + 696 = 889 IBFs over 3 levels, all 25 321 user bins present exactly once,
+no overlapping technical bin spans.
+
+The ten simulated datasets produce **identical layouts** to before these changes, and all of
+them got faster — 262144 went from 54 s to 33 s from cache, with fewer threads (24 vs 30).
+
 ## What is still open
 
 * **The two largest datasets keep a small third level** — 2 IBFs for 262144, 17 for 524288.
@@ -391,6 +511,12 @@ assignments, which is worth knowing before comparing against older benchmark num
 * **`function_tests` reports 4 failures** — seeding-after-splitting, climbing, splitting, and
   merge/split isolation. These predate the fix: the test output is byte-identical to a build
   from before it (51 TRUE / 4 FALSE both ways).
+* **RefSeq keeps a third level too** (696 IBFs at level 2), and 41 949 of its 170 688 technical
+  bins are empty. That is the same `global_bins` sizing question as above, amplified by RefSeq's
+  7021 clusters competing for 192 top level bins.
+* **The root binning still dominates the RefSeq runtime** — about 150 s of the 158 s, six passes
+  at roughly 20 s each, mostly in late merging and the fallback. The remaining cost is real work
+  rather than waste, but sampling `t_max` more cheaply would cut it near-proportionally.
 * **Content line order is not stable across builds.** `write_content` iterates an
   `unordered_map`, so two builds produce semantically identical layouts whose content lines are
   in different order. The parser does not care, but sorting by user bin id would make output
