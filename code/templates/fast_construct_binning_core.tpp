@@ -9,7 +9,8 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
     const double s,
     const size_t bins,
     const size_t t_max,
-    const std::vector<double>& fcorrs) {
+    const std::vector<double>& fcorrs,
+    std::unordered_map<const std::vector<size_t>*, size_t>* top_size_cache) {
 
     size_t deepest_lvl = labMaps.size() - 1;
     size_t par_lvl = (deepest_lvl > 0) ? deepest_lvl - 1 : deepest_lvl;
@@ -61,11 +62,30 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
         // below, and that child gets the same number of technical bins as this one. Letting a bin
         // grow past that guarantees the child has to merge again.
         if (!force && res[b].size() >= bins) return false;
+
         std::unordered_set<std::uint64_t>& sketch = bin_sketches[b];
+        const std::vector<std::uint64_t>& seq_sketch = fracmin_sketches[seq];
+        const bool may_reject = !force && !res[b].empty();
+
+        // Seeding, merging and the fallback all offer the same sequence to many bins in turn, so
+        // most calls end in a rejection. Both checks below make a rejection cheap: the union can
+        // never be smaller than either side, which rejects a full bin without touching the hash
+        // table, and the loop stops as soon as the union is known to exceed t_max instead of
+        // probing the whole sketch and throwing the result away. Neither changes which insertions
+        // are accepted.
+        if (may_reject && static_cast<size_t>(static_cast<double>(std::max(sketch.size(), seq_sketch.size())) / s) > t_max)
+            return false;
+
         std::vector<std::uint64_t> new_elems;
-        for (std::uint64_t elem : fracmin_sketches[seq])if (!sketch.count(elem)) new_elems.push_back(elem);
+        for (std::uint64_t elem : seq_sketch) {
+            if (sketch.count(elem)) continue;
+            new_elems.push_back(elem);
+            if (may_reject && static_cast<size_t>(static_cast<double>(sketch.size() + new_elems.size()) / s) > t_max)
+                return false;
+        }
+
         size_t potential_size = static_cast<size_t>(static_cast<double>(sketch.size() + new_elems.size()) / s);
-        if (!res[b].empty() && potential_size > t_max && !force) return false;
+        if (may_reject && potential_size > t_max) return false;
         for (std::uint64_t new_elem : new_elems) sketch.insert(new_elem);
         res[b].push_back(seq);
         binned.insert(seq);
@@ -187,12 +207,23 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
     for (auto& [component, node] : labMaps[0]) top_clusters.push_back(&component);
     top_sizes.reserve(top_clusters.size());
     for (const std::vector<size_t>* clust : top_clusters) {
-        std::vector<const std::vector<std::uint64_t>*> subset;
-        subset.reserve(clust->size());
-
-        for (size_t seq : *clust) subset.push_back(&fracmin_sketches[seq]);
-        size_t union_size = get_union_size_ptr(subset);
-        size_t estimated_size = static_cast<std::uint64_t>(static_cast<double>(union_size) / s);
+        // The estimated size of a cluster does not depend on t_max, but binning_core is called
+        // once per t_max while the refinement converges. The caller can hand in a cache so these
+        // unions are computed once per IBF instead of once per t_max.
+        size_t estimated_size = 0;
+        bool have_size = false;
+        if (top_size_cache) {
+            auto cached = top_size_cache->find(clust);
+            if (cached != top_size_cache->end()) { estimated_size = cached->second; have_size = true; }
+        }
+        if (!have_size) {
+            std::vector<const std::vector<std::uint64_t>*> subset;
+            subset.reserve(clust->size());
+            for (size_t seq : *clust) subset.push_back(&fracmin_sketches[seq]);
+            size_t union_size = get_union_size_ptr(subset);
+            estimated_size = static_cast<std::uint64_t>(static_cast<double>(union_size) / s);
+            if (top_size_cache) (*top_size_cache)[clust] = estimated_size;
+        }
         top_sizes[clust] = estimated_size;
         if (estimated_size < t_max) for (size_t seq : *clust) supersketch.push_back(&fracmin_sketches[seq]);
     }
@@ -272,7 +303,9 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
     /// After using Every cluster, we are left with our estimate usage of the Merge Bins.
     /// We start by entering the "biggest" small cluster and itterate over every usable bin. The small clusters left are used in the Fallback Mechanism.
     
-    size_t seeding_max_bin = (bins > allowed_merge) ? (bins - allowed_merge) : bins;
+    // Bins below merge_bins hold pieces of split sequences. record_bins expects those to stay a
+    // contiguous run of one-sequence bins, so nothing else may be placed there.
+    size_t seeding_max_bin = std::max(merge_bins, (bins > allowed_merge) ? (bins - allowed_merge) : bins);
     size_t empty_start = seeding_max_bin;
     size_t empty_end = bins;
 
@@ -357,7 +390,10 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
 
     
     size_t seeding_rr_bin = bin;
-    size_t num_seeding_bins = seeding_max_bin - start;
+    // Late merging reserves the tail of the bin range, and splitting consumes the head, so the
+    // seeding window can be empty. Subtracting unsigned without the guard wraps to ~2^64 and
+    // turns the loop below into an effectively infinite spin.
+    size_t num_seeding_bins = (seeding_max_bin > start) ? (seeding_max_bin - start) : 0;
 
     for (size_t cl = 0; cl < candidates.size(); cl++) {
         const std::vector<size_t>* cluster = candidates[cl];
@@ -492,10 +528,17 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
             }
             for (auto& s : skipped) still_fillable.push(s);
             if (!entered) {
-                size_t best_b = start;
-                size_t best_fill = track_fill[start];
+                // Late merging can claim every bin from `start` on, leaving start == bins. Indexing
+                // track_fill with it reads out of bounds and try_insert_sequence rejects b >= bins,
+                // which used to drop the sequence from the layout without a trace. Retry over every
+                // bin that is not part of the split region; if splitting claimed all of them there
+                // is genuinely no room and this t_max has overflowed.
+                if (merge_bins >= bins) return {res, {0,0,0}, track_fill, true};
+                size_t search_start = (start < bins) ? start : merge_bins;
+                size_t best_b = search_start;
+                size_t best_fill = track_fill[search_start];
 
-                for (size_t b = start + 1; b < bins; b++) {
+                for (size_t b = search_start + 1; b < bins; b++) {
                     if (track_fill[b] < best_fill) {
                         best_fill = track_fill[b];
                         best_b = b;

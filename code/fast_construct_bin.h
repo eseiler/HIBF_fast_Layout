@@ -35,7 +35,8 @@ template <typename Hasher>
 std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> binning(const std::vector<std::unordered_map<std::vector<size_t>, lemon::ListGraph::Node, Hasher>>& labMaps, 
                                             const std::vector<std::unordered_map<size_t,const std::vector<size_t>*>>& level_clusters,
                                             const std::vector<std::vector<std::uint64_t>>& fracmin_sketches,
-                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs);
+                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs,
+                                            std::unordered_map<const std::vector<size_t>*, size_t>* top_size_cache = nullptr);
 #include "templates/fast_construct_binning.tpp"
 
 // @brief In order to Bin Merge Bins again, we want to filter the LSH Tree in order to easily access the new bins again.
@@ -76,7 +77,8 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
                                             const std::vector<std::unordered_map<size_t,const std::vector<size_t>*>>& level_clusters,
                                             const std::vector<std::vector<std::uint64_t>>& fracmin_sketches,
                                             const std::vector<size_t>& relevant_seqs,
-                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs);
+                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs,
+                                            std::unordered_map<const std::vector<size_t>*, size_t>* top_size_cache = nullptr);
 #include "templates/fast_construct_binning_given_seqs.tpp"
 
 
@@ -93,7 +95,8 @@ template <typename Hasher>
 std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, std::vector<size_t>, bool> binning_core(const std::vector<std::unordered_map<std::vector<size_t>, lemon::ListGraph::Node, Hasher>>& labMaps, 
                                             const std::vector<std::unordered_map<size_t,const std::vector<size_t>*>>& level_clusters,
                                             const std::vector<std::vector<std::uint64_t>>& fracmin_sketches,
-                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs);
+                                            const double s, const size_t bins, const size_t t_max, const std::vector<double>& fcorrs,
+                                            std::unordered_map<const std::vector<size_t>*, size_t>* top_size_cache = nullptr);
 #include "templates/fast_construct_binning_core.tpp"
 
 // @brief given the amount of Hash functions used and the wanted false positive rate (fpr), compute for 100 bin sizes the correction factor.

@@ -122,9 +122,22 @@ auto refine_and_bin = [&](const std::vector<size_t>& seqs, size_t sub_bins, size
     size_t curr_lower = 0;
     size_t old_t_max = 0;
 
+    // Filtering the LSH forest down to this IBF's sequences depends only on `seqs`, and the
+    // estimated size of a cluster depends only on its contents. Both used to be redone for every
+    // t_max the refinement tried; hoisting them here makes the loop cost one binning pass each.
+    LSH_Filtered<Hasher> filtered;
+    const std::vector<std::unordered_map<std::vector<size_t>, lemon::ListGraph::Node, Hasher>>* use_maps = &labMaps;
+    const std::vector<std::unordered_map<size_t, const std::vector<size_t>*>>* use_clusts = &clusts;
+    if (!all_seqs) {
+        filtered = filter_LSH<Hasher>(labMaps, clusts, seqs);
+        use_maps = &filtered.filtered_labMaps;
+        use_clusts = &filtered.filtered_level_clusters;
+    }
+    // Keyed by cluster pointer, so it must not outlive `filtered`.
+    std::unordered_map<const std::vector<size_t>*, size_t> top_size_cache;
+
     auto run = [&](size_t t_max) {
-        return all_seqs ? binning(labMaps, clusts, fracmin_sigs, s, sub_bins, t_max, fcorrs)
-                        : binning_given_seqs(labMaps, clusts, fracmin_sigs, seqs, s, sub_bins, t_max, fcorrs);
+        return binning_core(*use_maps, *use_clusts, fracmin_sigs, s, sub_bins, t_max, fcorrs, &top_size_cache);
     };
 
     BinResult best;
