@@ -37,6 +37,9 @@ generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vec
     
     // Estimated cost of a layout, in k-mers. An IBF allocates all of its technical bins at the size
     // of the fullest one, and every merge bin turns into a whole additional IBF one level down.
+    // Charging sub_bins rather than the used bins keeps this a "make the fullest bin small"
+    // objective; charging the allocated 64-blocks instead was measured to buy fewer technical bins
+    // at the price of noticeably more lower level IBFs, so it is deliberately not done here.
     auto layout_cost = [](const BinResult& r, size_t sub_bins) {
         const std::vector<std::vector<size_t>>& result = std::get<0>(r);
         const std::vector<size_t>& fill = std::get<2>(r);
@@ -74,13 +77,15 @@ generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vec
             fill[b] = static_cast<size_t>(static_cast<double>(get_union_size_ptr(ptrs)) / s);
         }
 
-        // binning_core orders its bins empty first, then split bins, then merge bins; keep that.
+        // binning_core orders its bins split, then merge, then empty; keep that.
         std::vector<size_t> permutation(sub_bins);
         std::iota(permutation.begin(), permutation.end(), 0);
         std::sort(permutation.begin(), permutation.end(), [&res](size_t a, size_t b) {
+            const bool a_empty = res[a].empty();
+            const bool b_empty = res[b].empty();
+            if (a_empty != b_empty) return b_empty;
+            if (a_empty) return a < b;
             if (res[a].size() != res[b].size()) return res[a].size() < res[b].size();
-            if (res[a].empty()) return false;
-            if (res[b].empty()) return true;
             return res[a].front() < res[b].front();
         });
 
@@ -91,10 +96,9 @@ generate_hibf(const std::tuple<std::vector<std::vector<std::uint64_t>>, std::vec
             sorted_fill[i] = fill[permutation[i]];
         }
 
-        size_t split_start = 0;
-        while (split_start < sub_bins && sorted_res[split_start].empty()) split_start += 1;
-        size_t merge_start = split_start;
-        while (merge_start < sub_bins && sorted_res[merge_start].size() < 2) merge_start += 1;
+        size_t const split_start = 0;
+        size_t merge_start = 0;
+        while (merge_start < sub_bins && sorted_res[merge_start].size() == 1) merge_start += 1;
 
         return {std::move(sorted_res), std::make_tuple(split_start, size_t{0}, merge_start), std::move(sorted_fill), false};
     };

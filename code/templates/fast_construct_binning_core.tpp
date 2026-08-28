@@ -560,12 +560,18 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
 
     /// @note This is preperation for what will be returned.
 
+    // Pack the used bins to the front. The HIBF sizes an IBF from the highest technical bin index
+    // that appears in the layout, rounded up to a multiple of 64, and every technical bin costs the
+    // size of the fullest one. Trailing empty bins are therefore free, while leading ones are paid
+    // for in full. Order is split bins, then merge bins, then the empties.
     std::vector<size_t> permutation(res.size());
     std::iota(permutation.begin(), permutation.end(), 0);
-    std::sort(permutation.begin(), permutation.end(), [&res](size_t a, const size_t b) {
+    std::sort(permutation.begin(), permutation.end(), [&res](size_t a, size_t b) {
+        const bool a_empty = res[a].empty();
+        const bool b_empty = res[b].empty();
+        if (a_empty != b_empty) return b_empty;
+        if (a_empty) return a < b;
         if (res[a].size() != res[b].size()) return res[a].size() < res[b].size();
-        if (res[a].empty()) return false;
-        if (res[b].empty())return true;
         return res[a].front() < res[b].front();
     });
 
@@ -580,12 +586,12 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
     res = std::move(sorted_res);
     track_fill = std::move(sorted_trackfill);
 
-    auto merge_it = std::partition_point(res.begin(), res.end(), [](const std::vector<size_t>& bin) {return bin.size() < 2;});
-
-    auto split_it = std::partition_point(res.begin(), res.end(), [](const std::vector<size_t>& bin) {return bin.size() == 0;});
-
-    size_t merge_start = std::distance(res.begin(), merge_it);
-    size_t split_start = std::distance(res.begin(), split_it);
+    // With the empties at the back the sequence is [size 1 ...][size >= 2 ...][empty ...], which is
+    // not monotone for either predicate, so partition_point no longer applies. The used bins start
+    // at 0; merging starts at the first bin that does not hold exactly one sequence.
+    size_t const split_start = 0;
+    size_t merge_start = 0;
+    while (merge_start < res.size() && res[merge_start].size() == 1) merge_start += 1;
 
     return {res, std::make_tuple(split_start, split_bins, merge_start), track_fill, overflow};
 }
