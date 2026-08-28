@@ -1,0 +1,958 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{rule}{HTML}{C3CBD6}
+\definecolor{sunk}{HTML}{EDF0F4}
+\definecolor{accent}{HTML}{1A5C7A}
+\definecolor{warn}{HTML}{A84C18}
+\definecolor{okgreen}{HTML}{2C6449}
+\definecolor{muted}{HTML}{5C6572}
+
+\lstdefinestyle{promptstyle}{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=leftline,
+  framerule=2pt,
+  rulecolor=\color{accent},
+  framesep=8pt,
+  xleftmargin=10pt,
+  backgroundcolor=\color{sunk},
+  showstringspaces=false,
+}
+\lstdefinestyle{codestyle}{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  rulecolor=\color{rule},
+  framesep=6pt,
+  xleftmargin=4pt,
+  showstringspaces=false,
+  captionpos=b,
+  abovecaptionskip=4pt,
+}
+\lstset{style=codestyle}
+
+\newenvironment{promptbox}{\medskip}{\medskip}
+\newcommand{\code}[1]{\lstinline[basicstyle=\ttfamily\small]!#1!}
+\newcommand{\sha}[1]{\texttt{#1}}
+\newcommand{\good}[1]{\textcolor{okgreen}{\textbf{#1}}}
+\newcommand{\bad}[1]{\textcolor{warn}{#1}}
+
+\setlength{\LTpre}{6pt}\setlength{\LTpost}{6pt}
+\setlength{\emergencystretch}{3em}
+
+\title{\textbf{HIBF Fast Layout}\\[2pt]\large Claude Code session log}
+\author{Session with Claude Opus~5 \textperiodcentered{} repository \texttt{HIBF\_fast\_Layout}}
+\date{25--28 August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+A four-day debugging and optimisation session on the LSH-based HIBF layout generator. Eleven
+prompts, five rounds of measured improvement to the algorithm, and three experiments that were
+implemented, measured and reverted. The headline outcomes: a non-terminating layout computation
+made to terminate; spurious lower-level IBFs reduced from 5901 to 128 on the 16384 dataset; a
+RefSeq run that never finished in over 20 minutes brought to 158 seconds; every allocated-but-empty
+technical bin removed; and an estimated 10\% reduction in index size from a greedy re-split pass.
+Three latent correctness bugs were found and fixed along the way, one of which had been silently
+mis-assigning input files to user bins in every layout the tool had ever produced.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Session parameters}
+
+\begin{longtable}{@{}p{5.0cm}p{10.6cm}@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+\endhead
+Model & \texttt{claude-opus-5} (Claude Opus~5), selected with \texttt{/model opus} at
+  session start \\
+Reasoning effort & \textbf{Extra High} \\
+Harness & Claude Code, VS Code extension, \texttt{auto} mode (Bash-first tool policy) \\
+Working directory & \texttt{/srv/public/seiler/develop/HIBF\_fast\_Layout} \\
+Branch / base commit & \texttt{local}, starting from \sha{adb502a} (source unchanged since
+  \sha{4fa995e}) \\
+Machine & Linux 6.1.0-52-amd64, 112 cores, 1\,TB RAM \\
+Compiler & GCC 15.2.0. \texttt{/import/GCC/15.2.0} became unavailable mid-session (autofs key
+  present, backing server unresponsive); builds switched to
+  \texttt{/group/ag\_abi/software/bin/g++-15}, the same version, via
+  \texttt{make CXX=...} \\
+Build flags & \texttt{-std=c++23 -O3 -march=native -DNDEBUG -fopenmp -flto} \\
+Instrumented builds & \texttt{-O2}, no LTO, so symbols survive for \texttt{perf} \\
+Datasets & \texttt{hibf\_paper\_lsh/\{1024\ldots524288\}} (simulated, ${\sim}65$\,GB each,
+  \$BINS/64 genome groups of 64 near-duplicate pieces) and
+  \texttt{RefSeq/28\_01\_2022} (25\,321 gzipped genomes, 7021 LSH clusters) \\
+Layout invocation & \texttt{./generate\_layout <dir> 8 19 19 6767 0.05
+  15:4,20:5,15:6,10:12 0.001 5 2 <out> <threads> [sketch\_cache]} \\
+Threads & 32 for single runs, 24 when the ten simulated datasets ran back to back \\
+Verification & chopper \texttt{display\_layout general}; a purpose-written structural checker;
+  \texttt{function\_tests}; a numpy-based index-size proxy over the sketch cache \\
+\bottomrule
+\end{longtable}
+
+\section{Prompt overview}
+
+Elapsed times are wall-clock spans covering the whole turn, including tool execution, long
+background runs and waiting. They are reconstructed from scratchpad file timestamps and, where a
+commit closes the turn, from the commit time; they are therefore approximate except where noted.
+Commit SHAs are the user's commits of the work produced by that prompt.
+
+\begin{longtable}{@{}clp{5.0cm}rl@{}}
+\toprule
+\textbf{\#} & \textbf{Date} & \textbf{Prompt} & \textbf{Elapsed} & \textbf{Commit} \\
+\midrule
+\endhead
+1  & 25 Aug & Why so many lower levels?            & ${\sim}$47\,min & --- \\
+2  & 25 Aug & Analysis as shareable markdown       & ${\sim}$10\,min & \sha{1407a4f} \\
+3  & 25 Aug & Summarise the analysis step          & ${\sim}$12\,min & --- \\
+4  & 26 Aug & Fix everything; add the sketch cache & ${\sim}$110\,min & \sha{a0af981} \\
+5  & 26 Aug & Update markdown + artifact           & ${\sim}$13\,min & \sha{820eba0} \\
+6  & 27 Aug & RefSeq never finishes                & ${\sim}$78\,min & \sha{901822a} \\
+7  & 27 Aug & Update artifact with RefSeq findings & ${\sim}$9\,min  & \sha{dcd8c26} \\
+8  & 28 Aug & Fix the empty bins                   & ${\sim}$50\,min & \sha{8ba4344} \\
+9  & 28 Aug & Use all allocated bins, or advise    & ${\sim}$28\,min & (folded into \sha{ef9e80b}) \\
+10 & 28 Aug & Try the greedy split pass; TOC; steps & ${\sim}$40\,min & \sha{ef9e80b} \\
+11 & 28 Aug & This document                        & ---             & --- \\
+\bottomrule
+\end{longtable}
+
+\noindent
+Only prompt~1's duration was measured directly during the session (from the scratchpad creation
+time of 12:53:24 to the answer at approximately 13:40). The rest are derived from artifact
+timestamps.
+
+\section{Commits produced}
+
+\begin{longtable}{@{}llp{8.2cm}c@{}}
+\toprule
+\textbf{SHA} & \textbf{Committed} & \textbf{Contents} & \textbf{Prompt} \\
+\midrule
+\endhead
+\sha{1407a4f} & 25 Aug 15:30 & \texttt{LAYOUT\_LEVEL\_EXPLOSION.md}, \texttt{.gitignore},
+  \texttt{Makefile} & 2 \\
+\sha{a0af981} & 26 Aug 15:09 & The five defect fixes, three output-format fixes, sketch cache
+  (6 files) & 4 \\
+\sha{820eba0} & 26 Aug 15:22 & \texttt{LAYOUT\_LEVEL\_EXPLOSION.md} rewritten as
+  diagnosis + resolution & 5 \\
+\sha{901822a} & 27 Aug 17:18 & RefSeq performance fixes and two latent bugs (5 files) & 6 \\
+\sha{a5a2f35} & 27 Aug 17:18 & \emph{User's own change:} \texttt{.fna} $\rightarrow$ \texttt{.gz}
+  in the file filter & --- \\
+\sha{dcd8c26} & 27 Aug 17:27 & \texttt{LAYOUT\_LEVEL\_EXPLOSION.md} + RefSeq section & 7 \\
+\sha{8ba4344} & 28 Aug 12:26 & Bin packing (empty bins last) & 8 \\
+\sha{ef9e80b} & 28 Aug 14:38 & Greedy re-split pass (+65 lines) and the documentation for
+  prompts 9 and 10 & 9, 10 \\
+\bottomrule
+\end{longtable}
+
+\newpage
+
+\section{Prompt 1 --- Why does the layout keep adding levels?}
+\textbf{25 August} \textperiodcentered{} elapsed ${\sim}$47\,min \textperiodcentered{} no commit
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+/model opus
+Set model to claude-opus-5
+
+The layout starts to add many lower levels at some point:
+```
+1024.layout      64
+2048.layout      64
+4096.layout      64
+8192.layout      128
+16384.layout     5901
+32768.layout     1178
+65536.layout     3014
+131072.layout    4426
+262144.layout    8105
+524288.layout    15277
+```
+
+Can you figure out why? Too many are not good.
+
+Here is the same count for another algorithm, which is more like what I would expect
+```
+1024.layout      64
+2048.layout      64
+4096.layout      64
+8192.layout      128
+16384.layout     128
+32768.layout     192
+65536.layout     256
+131072.layout    384
+262144.layout    512
+524288.layout    768
+```
+
+in executables dir:
+
+```
+./generate_layout /srv/data/smehringer/data_simulated/hibf_paper_lsh/$BINS 8 19 19 6767 0.05 15:4,20:5,15:6,10:12 0.001 5 2 $BINS.output.layout 32
+```
+with $BINS being one of [1024,2048,...,524288]
+
+to build, run `make -B` (in the executables dir)
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+The dataset shape turned out to matter: \texttt{hibf\_paper\_lsh/\$BINS} is always the same
+${\sim}65$\,GB of content cut into \texttt{\$BINS/64} genome groups of 64 near-identical pieces, so
+LSH finds exactly one cluster per group and a whole group costs about as much as a single file
+(for 1024: union 996\,118 against sum 63\,983\,552, a 1:64 ratio). The target shape is two levels.
+
+Four defects were found, in decreasing order of impact.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{The overflow sentinel becomes a layout.} When \code{refine_and_bin} never finds a
+feasible \code{t_max}, \code{binning_core} returns \code{{0, 0, 0}} as
+\code{(split_start, split_bins, merge_start)}
+(\texttt{code/templates/fast\_construct\_binning\_core.tpp:140} and \texttt{:182}). With
+\code{merge_start == 0}, \code{generate_hibf} turns \emph{every} non-empty technical bin into its
+own lower-level IBF, single-sequence bins included. One such IBF costs about \code{global_bins}
+spurious children. This is what produced the 5901. It is also a correctness bug: the sentinel
+result is the partial binning built before the loop bailed out, so unplaced sequences are silently
+dropped.
+
+\item \textbf{\code{refine_and_bin} returns the last \code{t_max} it tried, not the best one.}
+\texttt{generate\_hibf.tpp:89} breaks out at \code{it == p} before the result is ever scored, and
+\code{b_res} is consulted only when the final result overflowed.
+
+\item \textbf{The scoring metric drives \code{t_max} onto the cliff.}
+\texttt{generate\_hibf.tpp:119} reads
+\code{if (split_bin_amt == 0 || split_avg < merge_avg)}. When an IBF has no merge bins ---
+the outcome we want --- \code{merge_average} returns 0
+(\texttt{code/fast\_construct\_bin.cpp:24}), so the comparison is always false and \code{t_max}
+is raised. The search is therefore guaranteed to climb until merge bins appear.
+
+\item \textbf{One global bin count for the whole tree.} \code{global_bins}
+(\texttt{generate\_hibf.tpp:168--176}) is computed once from the total user-bin count and reused
+at every level, so the root can pack more sequences into a merge bin than the child IBF has
+technical bins.
+\end{enumerate}
+
+Defects 2 and 3 together produce an \textbf{exact fixed point}: an IBF whose only merge bin
+contains precisely the sequence set it was given, on which \code{generate_hibf} then recurses
+forever.
+
+\medskip\noindent\textbf{Evidence.} On the 1024 dataset the code does not terminate:
+
+\begin{lstlisting}[style=codestyle]
+[L1#15]   [it 4] t_max=62122583 used=64 split_bins=64 merge_bins=0   <- ideal, sits in b_res
+[L1#15] END      t_max=62615619 nonempty=1 merge_start=63 -> children=1
+[L2#0]  START n_seqs=64 sub_bins=64 lower=62122 upper=3976832 init_t_max=31554328   <- identical
+[L3#0]  START n_seqs=64 sub_bins=64 lower=62122 upper=3976832 init_t_max=31554328   <- identical
+
+[LEVEL  1] ibfs=27 -> tasks=12 total_seqs_in_tasks=768
+[LEVEL 21] ibfs=12 -> tasks=12 total_seqs_in_tasks=768     <- still going when killed
+\end{lstlisting}
+
+\noindent Reproduced identically at \sha{9728f90}, so it predates the merge/seeding reorder.
+
+\medskip\noindent\textbf{Where 5901 comes from.} The instrumented \texttt{-O2} build produced 604
+lower-level IBFs on 16384 where the original \texttt{-O3 -flto} run produced 5901; hash-map
+iteration order differs between builds. The breakdown of the 604:
+
+\begin{longtable}{@{}p{11cm}r@{}}
+\toprule
+\textbf{Source} & \textbf{IBFs} \\
+\midrule
+Level 1, legitimate & 128 \\
+Level 2, from the one IBF that returned the overflow sentinel (defect 1) & 128 \\
+Level 2, from the 120 over-packed children (defect 4) & 348 \\
+\midrule
+Total & 604 \\
+\bottomrule
+\end{longtable}
+
+\noindent Scaling up, $128k + {\sim}140 \approx 5901$ gives $k \approx 45$: roughly 45 of the 128
+level-1 IBFs in the original run returned the overflow sentinel, against 1 here. Defect~1
+dominated the reported numbers.
+
+\medskip\noindent\textbf{Verification of the diagnosis.} A two-line scratchpad patch (score every
+feasible result and keep the best; raise the search ceiling above the largest single user bin)
+made 1024 terminate and cut 16384 from 604 to 367 with zero overflow sentinels --- enough to
+confirm the mechanisms, not a usable fix.
+
+\section{Prompt 2 --- Analysis as shareable markdown}
+\textbf{25 August} \textperiodcentered{} elapsed ${\sim}$10\,min \textperiodcentered{} commit \sha{1407a4f}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you give me your analysis as markdown, and add the filenames to the linesnumbers, the
+filenames are sometimes missing. I want to share your analysis.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+Produced \texttt{LAYOUT\_LEVEL\_EXPLOSION.md} (323 lines) in the repository root, with every source
+reference written as a full \texttt{path:line} code span so it survives copy-paste, plus a
+companion HTML artifact. Second-person phrasing from the chat was neutralised for sharing.
+
+The corrected references, all verified against the source at the time:
+
+\begin{longtable}{@{}p{9.4cm}p{5.8cm}@{}}
+\toprule
+\textbf{Reference} & \textbf{What it is} \\
+\midrule
+\endhead
+\texttt{.../fast\_construct\_generate\_hibf.tpp:48} & \code{curr_upper = curr_t_max * 2}, the too-low ceiling \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:89} & \code{if(it == p) break;} --- result returned unscored \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:94--96} & where \code{b_res} / \code{best_t_max} are set \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:119} & the \code{split_avg < merge_avg} metric \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:131--133} & \code{final_res} selection \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:168--176} & \code{get_sub_bins} / \code{global_bins} \\
+\texttt{.../fast\_construct\_generate\_hibf.tpp:213} & the loop from \code{merge_start} that creates children \\
+\texttt{.../fast\_construct\_binning\_core.tpp:140, :182} & the two \code{{0,0,0}} overflow returns \\
+\texttt{.../fast\_construct\_binning\_core.tpp:142} & \code{est_sketch_size >= t_max} force-split \\
+\texttt{.../fast\_construct\_binning\_core.tpp:255--259} & ``small cluster'' classification \\
+\texttt{.../fast\_construct\_binning\_core.tpp:265, :271, :275} & \code{allowed_merge} truncates to 0, merge region skipped \\
+\texttt{.../fast\_construct\_binning\_core.tpp:315--318, :361--363, :403} & candidates / seeding / climbing all no-op \\
+\texttt{.../fast\_construct\_binning\_core.tpp:438, :58} & the fallback and \code{try_insert_sequence} \\
+\texttt{code/fast\_construct\_bin.cpp:24} & \code{merge_average} returning 0 \\
+\bottomrule
+\end{longtable}
+
+\noindent A caveat was flagged with the deliverable: the 604-versus-5901 discrepancy is explained
+in the document, but the ``roughly 45 overflow IBFs'' figure is an inference from the reported
+number, not a measurement.
+
+\section{Prompt 3 --- Summary of the analysis step}
+\textbf{25 August} \textperiodcentered{} elapsed ${\sim}$12\,min \textperiodcentered{} no commit
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you give me a quick summary of the analysis step (i.e., the first prompt of this session)?
+Like what model was used, how much effort, other important parameters; especially how long did it
+take?
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+Reconstructed from file mtimes and captured \texttt{time}/\texttt{ps} output rather than estimated.
+Prompt~1 spanned 12:53:24 to approximately 13:40, about \textbf{47 minutes}.
+
+\begin{longtable}{@{}lp{11.6cm}@{}}
+\toprule
+\textbf{Time} & \textbf{Activity} \\
+\midrule
+\endhead
+12:53 & session start; read source and dataset layout \\
+12:55 & \texttt{make -B} of the repository binary (31.5\,s) \\
+12:55--13:05 & first 1024 run, foreground, hit the 10-minute tool timeout, killed \\
+13:05--13:16 & two more 1024 runs, both still looping when killed \\
+13:10 & instrumented build ready \\
+13:11--13:16 & instrumented 1024 run reached \texttt{LEVEL 21}; first hard evidence of non-termination \\
+13:17--13:20 & rebuilt \code{binning_core} from \sha{9728f90}, same loop, so not a regression \\
+13:21--13:30 & instrumented 16384 run completed (${\sim}8.5$\,min hashing, 18\,s of layout) \\
+13:33 & patched build ready \\
+13:36--13:37 & patch verified on 1024 and 16384 \\
+\bottomrule
+\end{longtable}
+
+\noindent The decisive accelerator was adding a sketch cache to \texttt{generate\_layout.cpp}: it
+turned an ${\sim}8$-minute FASTA hashing pass into a ${\sim}2$-second load. Roughly 13 of the 47
+minutes were spent before that, on two runs of the unmodified binary that could never have
+finished.
+
+\medskip\noindent Parameters reported: model \texttt{claude-opus-5}; 4 builds (1 repository build
+at \texttt{-O3 -flto}, 3 instrumented at \texttt{-O2}); 9 invocations of \texttt{generate\_layout},
+4 of which completed; \texttt{threads=32}; the machine sustained 1000--1500\% CPU during hashing.
+Reasoning effort was \emph{not} visible to the assistant at that point and was reported as unknown
+rather than guessed.
+\section{Prompt 4 --- Fix everything, and make the sketch cache permanent}
+\textbf{26 August} \textperiodcentered{} elapsed ${\sim}$110\,min \textperiodcentered{} commit \sha{a0af981}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you fix all the problems you found? Does it work then?
+Also, I think for testing it's a good idea to also add the sketch cache permamently.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+\subsubsection*{The five defect fixes}
+
+\begin{longtable}{@{}cp{9.0cm}p{4.6cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Fix} & \textbf{Where} \\
+\midrule
+\endhead
+1 & Overflow can no longer become a layout. \code{refine_and_bin} returns a scored feasible result
+    or a guaranteed-valid fallback, never the \code{{0,0,0}} sentinel. &
+    \texttt{generate\_hibf.tpp} \\
+2 & Search ceiling raised to $\max(2 \cdot \text{init},\ \max_i(|\text{sketch}_i|/s)\cdot 17/16)$,
+    so a non-overflowing \code{t_max} is always reachable. & \texttt{generate\_hibf.tpp:118, :121} \\
+3 & A real objective: \code{cost = technical_bins * fullest_bin + sum of merge-bin content}. Every
+    feasible candidate is scored and the best kept; the direction rule became ``overflow means
+    raise, otherwise lower''. & \texttt{generate\_hibf.tpp:40, :134, :151} \\
+4 & Progress guard: a merge bin may never hold its IBF's whole input, plus a
+    \code{fallback_layout} that is always valid and always shrinks. Recursion depth is now finite
+    by construction. & \texttt{generate\_hibf.tpp:54, :64} \\
+5 & \code{try_insert_sequence} refuses to grow a bin past \code{bins} sequences, since the child
+    IBF only has that many technical bins. & \texttt{binning\_core.tpp:63} \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}[style=codestyle,caption={Fix 2: above max\_single nothing is split, so binning\_core cannot run out of bins}]
+const size_t feasible_t_max = max_single + max_single/16 + 1;  // max_single = max_i(|sketch_i|/s)
+size_t curr_upper = std::max(curr_t_max * 2, feasible_t_max);
+\end{lstlisting}
+
+\subsubsection*{Three output-format bugs found while validating}
+
+None of these relate to the level explosion; they surfaced when the layouts were first checked
+against chopper's parser. All three are in \texttt{code/fast\_construct\_bin.cpp}.
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Line 124 --- the lower-level header was missing its colon.} The top-level line had
+it, the lower-level line did not, so \code{layout::read_from} could not parse the header:
+\begin{lstlisting}[style=codestyle]
+wrote:    #LOWER_LEVEL_IBF_48 fullest_technical_bin_idx17
+expected: #LOWER_LEVEL_IBF_48 fullest_technical_bin_idx:17
+\end{lstlisting}
+\item \textbf{Line 43 --- \code{@CHOPPER_USER_BINS_END} had no trailing newline}, so it ran into
+the following \code{@CHOPPER_CONFIG} and produced the line
+\code{@CHOPPER_USER_BINS_END@CHOPPER_CONFIG}.
+\item \textbf{Lines 38--44 --- the user-bin section was emitted in
+\code{std::unordered_map} order.} \code{chopper::layout::read_filenames_from} reads that section
+\emph{positionally} (\code{filenames.emplace_back()}); the \code{@<id>} on each line is only
+cross-checked under \code{assert}. In a release build every user bin was therefore silently paired
+with a file belonging to a different one. \textbf{Every layout the tool produced before
+\sha{a0af981} had scrambled user-bin-to-file assignments} --- relevant before comparing against
+older benchmark numbers.
+\end{enumerate}
+
+\subsubsection*{The sketch cache}
+
+\code{read_sketch_cache} / \code{write_sketch_cache} in
+\texttt{code/fast\_construct\_hashing.cpp:97} and \texttt{:127}, declared in
+\texttt{fast\_construct\_hashing.h}, wired to an optional 13th argument. The file header stores
+\code{dir_path}, \code{q}, \code{k}, \code{w}, \code{seed} and \code{s}, and the loader refuses a
+cache written with different parameters, so a stale one cannot be picked up silently.
+
+\subsubsection*{Results}
+
+\begin{lstlisting}[style=codestyle,caption={The shape every dataset now has}]
+[hibf] level 0: 1 IBF(s), 128 merge bin(s) to expand
+[hibf] level 1: 128 IBF(s), 0 merge bin(s) to expand
+\end{lstlisting}
+
+\begin{longtable}{@{}rrrrc@{}}
+\toprule
+\textbf{\$BINS} & \textbf{before} & \textbf{after} & \textbf{chopper} & \textbf{levels} \\
+\midrule
+\endhead
+1024   & \bad{never terminates} & \good{16}  & 64  & 2 \\
+2048   & 64                     & \good{32}  & 64  & 2 \\
+4096   & 64                     & \good{64}  & 64  & 2 \\
+8192   & 128                    & \good{128} & 128 & 2 \\
+16384  & \bad{5901}             & \good{128} & 128 & 2 \\
+32768  & \bad{1178}             & \good{192} & 192 & 2 \\
+65536  & \bad{3014}             & \good{256} & 256 & 2 \\
+131072 & \bad{4426}             & \good{384} & 384 & 2 \\
+262144 & \bad{8105}             & \good{514} & 512 & 3 \\
+524288 & \bad{15277}            & \good{785} & 768 & 3 \\
+\bottomrule
+\end{longtable}
+
+\noindent Verified three ways: chopper's \texttt{display\_layout general} parses them (for 16384 it
+reports 128 top-level bins, all \texttt{merged}, \texttt{ub\_count=128}, sizes 7.81e6 within 0.5\%
+of each other); a structural checker confirms every user bin appears exactly once, headers and
+content agree and are in level order, and technical bin spans do not overlap; and
+\texttt{function\_tests} output is byte-identical to a build from before the fix (51 TRUE / 4
+FALSE --- those four already failed).
+
+\medskip\noindent\textbf{Sketch cache effect:} 16384 went from 363\,s to 13\,s, 262144 from 983\,s
+to 54\,s, with a byte-identical layout (\texttt{cmp} clean).
+
+\medskip\noindent\textbf{Residual, reported honestly:} 262144 and 524288 keep a small third level
+(2 and 17 IBFs). Measured cause: the occupancy cap is exactly \code{bins}, leaving a child no slack
+for a sequence that must split across two technical bins. For 262144 the geometry is exactly tight
+--- every level-1 IBF holds exactly 512 user bins in exactly 512 technical bins ($512 \times 512 =
+262144$) --- and lowering the cap does not help because the root has no slack either.
+
+\section{Prompt 5 --- Update the markdown and the artifact}
+\textbf{26 August} \textperiodcentered{} elapsed ${\sim}$13\,min \textperiodcentered{} commit \sha{820eba0}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Yes, I want LAYOUT_LEVEL_EXPLOSION.md and the artifact updated with the fixes and the results
+table.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+\texttt{LAYOUT\_LEVEL\_EXPLOSION.md} was restructured from a pure diagnosis into a
+diagnosis-and-resolution document (418 lines), and the artifact was redeployed to the same URL.
+
+\begin{itemize}[leftmargin=*]
+\item Result section moved to the front with the full before/after/chopper table and the
+three-way validation.
+\item The diagnosis was kept intact; \texttt{Cause N} was renamed \texttt{Defect N} and put in
+past tense.
+\item A new ``The fix'' section replaced ``Suggested fixes'', with line numbers against
+\sha{a0af981}.
+\item New sections on the three output-format bugs and on what remained open.
+\item A ``Testing'' section documenting the sketch cache and the cold-versus-cached timings.
+\end{itemize}
+
+\noindent Two observations were flagged rather than acted on: the user's own tweak to
+\code{write_linkage} in \sha{a0af981} (an indexed loop instead of the sorted one) produces identical
+output, verified by re-running 16384; and the uncommitted \texttt{Makefile} change to
+\texttt{CXX = g++} needs to resolve to a C++23-capable compiler, since the system \texttt{g++} on
+this machine is 12.2.
+
+\section{Prompt 6 --- RefSeq never finishes}
+\textbf{27 August} \textperiodcentered{} elapsed ${\sim}$78\,min \textperiodcentered{} commit \sha{901822a}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you have a look at another dataset:
+```
+./generate_layout "/srv/data/datasets/RefSeq/28_01_2022/" 8 19 19 6767 0.05 15:4,20:5,15:6,10:12 0.001 5 2 refseq.output.layout 32 refseq.bin
+```
+The chached sketches are at `/srv/public/seiler/develop/HIBF_fast_Layout/executables/refseq.bin`
+if you want to reuse them.
+
+the problem is that it takes very long; i've terminated it after 20 minutes.
+Do you see any problems that might cause this?
+If so, fix them.
+
+Another note, in the staged changes, I changed `.fna` to `.gz`. This is because this data set is
+gzipped and I just need the loop to add them to the file list. seqan3's sequence file input
+handles the compression (otherwise, it would throw). This workaround is fine for now.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+RefSeq is a fundamentally different shape from the simulated data, and that difference is what
+exposed the problems.
+
+\begin{longtable}{@{}p{6.6cm}rr@{}}
+\toprule
+ & \textbf{simulated 16384} & \textbf{RefSeq} \\
+\midrule
+\endhead
+user bins & 16384 & 25321 \\
+LSH top-level clusters & 256 & \bad{7021} \\
+technical bins (\code{global_bins}) & 128 & 192 \\
+clusters per technical bin & 2 & \bad{37} \\
+sequence sizes & uniform & highly variable \\
+\bottomrule
+\end{longtable}
+
+\noindent The simulated data is 64 near-duplicates per genome, so almost every insertion is
+accepted on the first attempt. RefSeq is genuinely diverse, so almost every attempt is
+\emph{rejected} --- and the rejection path is where all the cost and both latent bugs were.
+
+\subsubsection*{Finding 1 --- a rejected insertion cost a full sketch scan, thrown away}
+
+\code{try_insert_sequence} probed the bin's hash set once per element of the sequence's sketch,
+computed the union size, and only then decided. On rejection all of that work was discarded, and
+seeding, late merging and the fallback each offer the same sequence to up to \code{bins} bins in
+turn, giving $O(n_{\text{seqs}} \cdot \text{bins} \cdot |\text{sketch}|)$ hash probes.
+
+\begin{lstlisting}[style=codestyle,caption={One root binning pass, before the fix}]
+[bc] nseq=25321 bins=192 t_max=151249359 clust=7021 | ... fallback=68501ms TOTAL=76044ms
+     try=1391818 rej_tmax=253345 lookups=1073.8M
+\end{lstlisting}
+
+\noindent 1.07 billion hash probes in a single pass, 68\,s of it in the fallback alone, repeated
+for every \code{t_max}. Fixed at \texttt{binning\_core.tpp:68--85} with two exact checks: the union
+can never be smaller than either side, which rejects a full bin without touching the hash table at
+all, and the loop stops as soon as the running union is known to exceed \code{t_max}. Neither
+changes which insertions are accepted.
+
+\subsubsection*{Finding 2 --- work independent of \texttt{t\_max} redone for every \texttt{t\_max}}
+
+The estimated size of every top-level cluster (7021 \code{get_union_size_ptr} calls, 2.1\,s per
+pass) and, for child IBFs, \code{filter_LSH} over the entire 33\,569-cluster forest, were both
+recomputed on each of the six refinement passes. The cluster sizes are now cached per IBF
+(\texttt{binning\_core.tpp:216}, cache owned at \texttt{generate\_hibf.tpp:137}) and
+\code{filter_LSH} is hoisted to run once per IBF (\texttt{generate\_hibf.tpp:132}). Visible in the
+trace: \texttt{top=2119ms} on the first pass, \texttt{top=1ms} on the five after it.
+
+\subsubsection*{Finding 3 --- an unsigned underflow that spins about $2^{64}$ times}
+
+\begin{lstlisting}[style=codestyle]
+size_t num_seeding_bins = seeding_max_bin - start;   // wraps when start > seeding_max_bin
+\end{lstlisting}
+
+\noindent Late merging reserves the tail of the bin range and splitting consumes the head, so the
+seeding window can be empty; the subtraction then wraps to about 1.8e19 and the loop below it
+spins essentially forever on cheap operations. It fired \textbf{268 times} in one RefSeq run, e.g.
+\texttt{start=192 seeding\_max\_bin=191 bins=192} --- off by a single bin. The symptom was one
+child IBF at 100\% CPU while its 191 siblings each finished in 0.5\,s. Unchanged since at least
+\sha{4fa995e}. Clamped to 0 at \texttt{binning\_core.tpp:396}.
+
+\subsubsection*{Finding 4 --- an out-of-bounds read that silently dropped user bins}
+
+\begin{lstlisting}[style=codestyle]
+size_t best_b = start;
+size_t best_fill = track_fill[start];   // start == bins reads past the end
+...
+try_insert_sequence(seq, best_b, true); // and this rejects b >= bins, so nothing is placed
+\end{lstlisting}
+
+\noindent The sequence never reached the child IBF, but it still had a root-level entry pointing at
+the merge bin it came from --- so 342 user bins ended up claiming technical bins belonging to other
+user bins: corrupt entries rather than missing ones. Also pre-existing. Fixed at
+\texttt{binning\_core.tpp:536--537} by retrying over the bins outside the split region and
+reporting overflow if splitting claimed all of them, which the \code{t_max} search then resolves.
+The merge window is clamped the same way at \texttt{binning\_core.tpp:308}, because bins below
+\code{merge_bins} hold pieces of split sequences and \code{record_bins} needs those to stay a
+contiguous run.
+
+\medskip\noindent A first attempt that simply searched from bin~0 traded the 342 dropped user bins
+for 153 impossible four-level paths --- the force path had started writing into split bins ---
+which is how that constraint surfaced.
+
+\subsubsection*{Result}
+
+\begin{longtable}{@{}p{7.2cm}p{4.0cm}p{3.4cm}@{}}
+\toprule
+ & \textbf{before} & \textbf{after} \\
+\midrule
+RefSeq, 25\,321 genomes & \bad{terminated after 20\,min, no output} & \good{158\,s} \\
+\bottomrule
+\end{longtable}
+
+\noindent Structure: $1 + 192 + 696 = 889$ IBFs over 3 levels, all 25\,321 user bins present
+exactly once, no overlapping technical bin spans. The ten simulated datasets produce identical
+layouts and all got faster: 262144 went from 54\,s to 33\,s from cache, with fewer threads
+(24 against 30).
+
+\medskip\noindent\textbf{Diagnostic method note:} \texttt{perf} attribution was useless here
+because LTO inlined everything into \code{binning_core}, and \texttt{gdb} could not attach
+(\texttt{ptrace} blocked). The problem was localised instead by building an \texttt{-O2}
+instrumented copy with per-phase timers inside \code{binning_core}, which showed all phases
+completing in ${\sim}14$\,s and then nothing --- pointing directly at the seeding loop.
+
+\section{Prompt 7 --- Update the artifact with the RefSeq findings}
+\textbf{27 August} \textperiodcentered{} elapsed ${\sim}$9\,min \textperiodcentered{} commit \sha{dcd8c26}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you also update the artifact with the problem description and what you found out and how you
+fixed it?
+
+[sent mid-turn, while the RefSeq investigation of prompt 6 was still running]
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+Both documents gained a ``RefSeq: a different failure'' part: the dataset comparison table, the four
+findings as a ranked list, the instrumented traces, and the result. The markdown was retitled
+\emph{Two failures in the fast layout, diagnosed and fixed} since it now covered two investigations,
+and grew to 545 lines. The artifact was redeployed to the same URL with a matching section.
+\section{Prompt 8 --- Fix the empty bins}
+\textbf{28 August} \textperiodcentered{} elapsed ${\sim}$50\,min \textperiodcentered{} commit \sha{8ba4344}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you try to fix the issue with the many empty bins?
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+\code{binning_core} sorted its bins ascending by size, which put the \textbf{empty bins at the low
+indices} and the used ones at the top. But seqan::hibf derives an IBF's technical bin count from
+the \emph{highest} index in the layout and allocates that many rounded up to a multiple of 64:
+
+\begin{lstlisting}[style=codestyle]
+// seqan::hibf/src/layout/graph.cpp:81
+number_of_technical_bins = std::max(number_of_technical_bins, bin + num_tbs);
+
+// seqan::hibf/src/interleaved_bloom_filter.cpp:41-43
+bin_words      = divide_and_ceil(bins, 64u);
+technical_bins = bin_words * 64u;
+resize(technical_bins * bin_size_);
+\end{lstlisting}
+
+\noindent Trailing empty bins are therefore free; leading ones are paid for in full. An IBF using
+16 bins at indices 48--63 still declared, and allocated, 64.
+
+\medskip\noindent\textbf{The fix} inverts the ordering to \textbf{split bins, then merge bins, then
+the empties}, packing used bins at $0 \ldots k-1$. That required replacing the two
+\code{partition_point} calls with an explicit scan, since \texttt{[size 1][size >= 2][empty]} is not
+monotone for either predicate. It is a pure relabelling: same bins, same contents, same sequences.
+
+\begin{longtable}{@{}lrrr@{}}
+\toprule
+\textbf{RefSeq} & \textbf{declared tbins} & \textbf{empty} & \textbf{allocated (64-padded)} \\
+\midrule
+before & 170\,688 & \bad{41\,949 (25\%)} & 170\,688 \\
+after  & 128\,739 & \good{0}             & \good{145\,792 ($-15\%$)} \\
+\bottomrule
+\end{longtable}
+
+\noindent Every dataset now reports \texttt{empty\_tbins=0}, all layouts still validate, every
+lower-level IBF count is unchanged, and RefSeq runtime is unchanged.
+
+\subsubsection*{Tried and reverted: charging allocated 64-blocks in \texttt{layout\_cost}}
+
+Arguably the more correct model, since the IBF really only allocates
+$\lceil \text{used}/64 \rceil \cdot 64$ bins. Measured, it cuts RefSeq's allocated bins further to
+126\,144 (waste 12\% to 7\%) but buys that with more IBFs: RefSeq 889 to 1059, and 524288 from 785
+to 890. Since the net memory effect could not be confirmed without measuring real bin sizes, and
+``too many lower levels'' was the original complaint, it was reverted, with the measurement recorded
+in a comment at \texttt{generate\_hibf.tpp:38--43}.
+
+\section{Prompt 9 --- Use all allocated bins, or advise}
+\textbf{28 August} \textperiodcentered{} elapsed ${\sim}$28\,min \textperiodcentered{} documentation folded into \sha{ef9e80b}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you try to use all allocated bins (i.e., in your example, use 128 instead of 100, because we
+allocate 128 anyway). If it's not trivial to do, or it changes the algorithm drastically, do not
+do it, and just summarise possible avenues to achieve the goal.
+Afterwards, please update the markdown and artifact with the changes/findings from the previous
+and this prompt.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+The recommendation at this point was \textbf{not to implement it}, on the following measurements.
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{The free lever does not work.} \texttt{p=12} instead of \texttt{5} leaves the padding
+waste at 12\% and doubles the runtime (303\,s against 143\,s). The \code{t_max} bisection already
+sits at the overflow boundary.
+\item \textbf{The waste is thin and spread out}, not concentrated:
+\end{itemize}
+
+\begin{longtable}{@{}lrr@{}}
+\toprule
+\textbf{used bins} & \textbf{\#IBFs} & \textbf{padding wasted} \\
+\midrule
+1--64    &  36 &   157 \\
+65--128  & 317 & 7\,507 \\
+129--192 & 536 & 9\,389 \\
+\bottomrule
+\end{longtable}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Best case if it worked perfectly:} a split bin's fill is exactly its sequence's sketch
+size, so this is computable from the cache. Greedily handing every spare bin to the currently
+fullest user bin, with fcorr applied, gives a \textbf{16.1\%} smaller \code{bin_size} across the 716
+IBFs that could use it --- mostly modest (302 under 10\%, 295 between 10 and 20\%).
+\end{itemize}
+
+\noindent Getting it would need an \textbf{fcorr-aware fill model} (\code{track_fill} holds raw
+content and \code{layout_cost} ignores fcorr, so the search cannot see the trade-off) and a
+\textbf{re-splitting pass} preserving the split-bin contiguity invariant --- the same invariant
+behind two of the earlier bugs. That was judged past the ``not trivial'' bar.
+
+\subsubsection*{Avenues offered, best effort-to-benefit first}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Size \code{global_bins} per IBF instead of globally.} \code{get_sub_bins} hands every
+IBF $\lceil \sqrt{N_{\text{total}}}/64 \rceil \cdot 64$; a child holding 133 sequences gets 192
+bins. Worth about 12\% of allocated bins, no re-splitting. Changes tree shape, needs full
+re-verification.
+\item \textbf{Charge allocated 64-blocks in \code{layout_cost}.} Already written and measured (see
+prompt~8); the cheapest lever if the extra IBFs turn out not to matter.
+\item \textbf{Greedy re-split post-pass.} The 16.1\% option.
+\item \textbf{Accept it.} 12\% of allocated technical bins on RefSeq, 0--4\% on the simulated data.
+\end{enumerate}
+
+\noindent Both documents were updated with an ``Empty technical bins'' section carrying the packing
+fix, the before/after numbers and these avenues.
+
+\section{Prompt 10 --- Try the greedy split pass; add a TOC and the steps}
+\textbf{28 August} \textperiodcentered{} elapsed ${\sim}$40\,min \textperiodcentered{} commit \sha{ef9e80b}
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you try out the greedy split pass? If this turns out to work well, please update the markdown
+and artifact. For the artifact, please also add a toc if possible; and somehow indicate the
+fixes/steps taken -- what I mean is that we iteratively improved the algorithm and I'd like an
+indication of the steps, I.e. what did we do first, what was the next step, etc.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+The pass works and was kept. 65 lines in
+\texttt{code/templates/fast\_construct\_binning\_core.tpp}, after placement and before the final
+sort:
+
+\begin{lstlisting}[style=codestyle]
+used   = non-empty bins
+target = min(bins, ceil(used / 64) * 64)      // what the HIBF allocates anyway
+spare  = target - used
+
+while spare > 0:
+    take the split user bin with the largest fcorrs[k] * (content / k)
+    stop if it is not larger than the fullest merge bin      (merge bins cannot be split)
+    stop if giving it one more bin does not lower its demand (fcorrs[k+1] outgrows the division)
+    give it a free bin, re-partition its content evenly over k+1 bins
+\end{lstlisting}
+
+\noindent Three properties keep it cheap and safe. \textbf{Merged bins are excluded} --- splitting
+one would mean a whole new child IBF, so the fullest merged bin is a floor on what the pass can
+achieve and it stops there. \textbf{No contiguity work is needed}: the final sort orders by
+\texttt{(size, front sequence)}, so the $k+1$ technical bins of a user bin end up adjacent by
+construction, which is exactly what \code{record_bins} requires. And \textbf{\code{bin_sketches} is
+never touched} --- it is local to \code{binning_core} and dead after this point, so only \code{res}
+and \code{track_fill} need updating.
+
+\subsubsection*{Result}
+
+Measured as
+\[
+  \sum_{\text{IBF}} \bigl(\text{allocated technical bins}\bigr) \times \bigl(\text{bin size}\bigr),
+\]
+where a split user bin's demand is $\text{fcorrs}[k] \cdot \text{content}/k$ and a merged bin's is
+the union of its whole subtree, computed from the sketch cache with numpy.
+
+\begin{longtable}{@{}lrrr@{}}
+\toprule
+\textbf{RefSeq} & \textbf{IBFs} & \textbf{allocated tbins} & \textbf{estimated index size} \\
+\midrule
+packing only          & 889          & 145\,792 & 100.0\% \\
++ greedy re-split     & \good{883}   & 153\,216 & \good{89.8\%} \\
++ fcorr-aware cost    & 1105         & 186\,368 & 94.3\% \\
+\bottomrule
+\end{longtable}
+
+\noindent A 10\% smaller index, slightly \emph{fewer} IBFs, runtime unchanged at ${\sim}141$\,s,
+padding waste 12\% to 1\%. The ten simulated datasets are unchanged --- same lower-level IBF counts,
+same estimated size (1024, 16384 and 524288 all measured at exactly 100.0\%). That is the expected
+profile: the pass only fires where an IBF has both spare bins and split bins.
+
+\subsubsection*{The companion change that backfired}
+
+Making \code{layout_cost} fcorr-aware --- replacing raw \code{max_fill} with
+$\max_{\text{user bins}} \text{fcorrs}[k] \cdot (\text{content}/k)$ --- looks necessary, since the
+cost model otherwise prices splitting as free. Measured, it makes things \textbf{worse}: 94.3\%
+against 89.8\%, with IBFs jumping from 883 to 1105.
+\code{sub_bins * max_demand} with an fcorr-inflated demand overstates the cost of exactly the
+split-heavy layouts the pass is designed to produce, so the \code{t_max} search retreats to more,
+smaller merged bins. Reverted.
+
+\subsubsection*{A measurement trap worth recording}
+
+The first size proxy summed $\text{allocated\_tbins} \times \text{bin\_size}$ over only those IBFs
+with no merged bins, because a merged bin's demand needs the union of its whole subtree. That set of
+IBFs differs between layouts, so the sum compared different things and reported the pass as 10\%
+\emph{worse}. Computing the merged unions properly reversed the sign. This was corrected in the
+session and is recorded in both documents.
+
+\subsubsection*{Document changes requested}
+
+The artifact gained a two-column, anchor-linked \textbf{table of contents} over all 16 sections, and
+a \textbf{``How we got here''} stepped timeline of the five rounds in order --- each with its commit
+and headline metric --- plus a greyed-out final entry for the three experiments that were written,
+measured and reverted, since what they ruled out shaped the next step.
+
+\section{Prompt 11 --- This document}
+\textbf{28 August} \textperiodcentered{} no commit
+\begin{promptbox}
+\begin{lstlisting}[style=promptstyle]
+Can you please create a latex document of this complete session? Store it locally in the working
+directory as `claude.tex`. It should include parameters (your effort is set to `Extra High`),
+prompts and output. You do not need to include the individual think steps -- the prompt and final
+output for the prompt is enough. If you know how long a promp took to process, include the total
+time to process a prompt. If the result of a prompt was added as commit to the repository, please
+include the commit sha.
+\end{lstlisting}
+\end{promptbox}
+\subsection*{Output}
+
+This file, \texttt{claude.tex}, written to the repository root. Timings are reconstructed from
+scratchpad artifact timestamps and commit times as described in section~2; only prompt~1's duration
+was measured directly during the session. The document was compiled with \texttt{pdflatex} to
+confirm it builds.
+
+\section{Cumulative outcome}
+
+\begin{longtable}{@{}p{6.4cm}p{4.2cm}p{4.2cm}@{}}
+\toprule
+\textbf{Metric} & \textbf{Session start (\sha{adb502a})} & \textbf{Session end (\sha{ef9e80b})} \\
+\midrule
+1024, lower-level IBFs   & \bad{never terminates} & \good{16} \\
+16384, lower-level IBFs  & \bad{5901}             & \good{128} \\
+32768                    & \bad{1178}             & \good{192} \\
+65536                    & \bad{3014}             & \good{256} \\
+131072                   & \bad{4426}             & \good{384} \\
+262144                   & \bad{8105}             & \good{514} \\
+524288                   & \bad{15277}            & \good{785} \\
+RefSeq (25\,321 genomes) & \bad{$>$20\,min, no output} & \good{141\,s, 883 IBFs} \\
+RefSeq empty technical bins & \bad{41\,949}       & \good{0} \\
+RefSeq estimated index size & 100\%               & \good{89.8\%} \\
+User bin to file mapping & \bad{scrambled (silent)} & \good{correct} \\
+Layout parseable by chopper & \bad{no (three format bugs)} & \good{yes} \\
+16384 re-run from cache  & 363\,s                 & \good{12\,s} \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Bugs fixed, by kind}
+
+\begin{longtable}{@{}p{4.2cm}p{6.0cm}p{4.6cm}@{}}
+\toprule
+\textbf{Kind} & \textbf{Bug} & \textbf{Consequence} \\
+\midrule
+\endhead
+Non-termination & Refinement returns the last, unscored \code{t_max}; metric climbs onto the
+  collapse point & 1024 looped forever \\
+Layout explosion & \code{{0,0,0}} overflow sentinel emitted as a layout & thousands of spurious
+  IBFs, plus dropped sequences \\
+Layout explosion & \code{global_bins} fixed tree-wide & forced merging one level down \\
+Correctness & User-bin section written in hash order, read positionally & every user bin paired
+  with the wrong file \\
+Correctness & Missing colon in lower-level header & layout unparseable \\
+Correctness & Missing newline after \code{@CHOPPER_USER_BINS_END} & layout unparseable \\
+Correctness & Out-of-bounds \code{track_fill[start]} with \code{start == bins} & 342 user bins
+  claimed other bins' technical bins \\
+Hang & \code{seeding_max_bin - start} unsigned underflow & ${\sim}2^{64}$-iteration spin \\
+Performance & Rejected insertion cost a full sketch scan & 1.07e9 hash probes per pass \\
+Performance & \code{t_max}-independent work redone per \code{t_max} & 2.1\,s per pass, x6 \\
+Space & Empty bins sorted first, so allocated & 41\,949 bins paid for and unused \\
+Space & Allocated-but-unused bins never spent & 10\% larger index \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Still open}
+
+\begin{itemize}[leftmargin=*]
+\item 262144 and 524288 keep a small third level (2 and 17 IBFs); the occupancy cap is exactly
+\code{bins}, and for 262144 the geometry is exactly tight so lowering it does not help.
+\item RefSeq keeps a third level of 690 IBFs, and the root binning still dominates its runtime
+(${\sim}150$\,s of 158\,s) --- real work now rather than waste.
+\item \texttt{function\_tests} reports 4 failures (seeding-after-splitting, climbing, splitting,
+merge/split isolation). These predate the session: output is byte-identical to a build from before
+any change.
+\item Content line order is not stable across builds, since \code{write_content} iterates an
+\code{unordered_map}. The parser does not care, but sorting by user bin id would make output
+byte-reproducible.
+\item Whether the block-aware \code{layout_cost} is a net win is unresolved; a real
+\texttt{raptor build} size comparison would settle it.
+\item RefSeq's layout is validated by the structural checker but not yet by chopper's
+\texttt{display\_layout}, which was stopped as too expensive.
+\end{itemize}
+
+\subsection*{Artefacts produced}
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{LAYOUT\_LEVEL\_EXPLOSION.md} --- 699 lines, the full diagnosis and resolution record.
+\item A published HTML artifact carrying the same material with a table of contents and a stepped
+timeline.
+\item \texttt{check\_layout.py} --- structural validator for chopper/raptor layout files.
+\item \texttt{blocks.py}, \texttt{size\_proxy.py}, \texttt{full\_size.py} --- technical bin and
+index-size analysis over the sketch cache.
+\item The sketch cache itself, now a permanent feature of \texttt{generate\_layout}.
+\end{itemize}
+
+\end{document}
