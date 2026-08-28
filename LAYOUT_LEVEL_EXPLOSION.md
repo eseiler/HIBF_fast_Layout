@@ -6,6 +6,9 @@ Two separate investigations of `generate_layout`:
    `adb502a`, fixed in `a0af981`.
 2. **A run that never finished** on RefSeq (25 321 gzipped genomes) — fixed in `901822a`.
 
+Plus two follow-ups on wasted technical bins: packing (`8ba4344`) and a greedy re-split pass
+(uncommitted) — see *Empty technical bins* and *Spending the spare bins*.
+
 The first is sections 1-9 below, the second is *RefSeq: a different failure*.
 
 ## Result
@@ -489,6 +492,159 @@ no overlapping technical bin spans.
 The ten simulated datasets produce **identical layouts** to before these changes, and all of
 them got faster — 262144 went from 54 s to 33 s from cache, with fewer threads (24 vs 30).
 
+## Empty technical bins
+
+After the two investigations above, every layout carried technical bins that were declared and
+paid for but never filled — 41 949 of RefSeq's 170 688, and 48 of the 64 in the 1024 root.
+
+### Why they were there
+
+`binning_core` sorted its bins ascending by size, which put the **empty bins at the low indices**
+and the used ones at the top. But the HIBF derives an IBF's technical bin count from the
+*highest* index that appears in the layout
+(`seqan::hibf::layout::graph.cpp:81`, `number_of_technical_bins = max(bin + num_tbs)`) and then
+allocates
+
+```
+ceil(count / 64) * 64  *  bin_size   bits
+```
+
+(`interleaved_bloom_filter.cpp:41-43`). Trailing empty bins are therefore free; leading ones are
+paid for in full. An IBF using 16 bins at indices 48-63 still declared, and allocated, 64.
+
+### The fix
+
+Invert the ordering to **split bins, then merge bins, then the empties**, so the used bins are
+packed at 0..k-1. That meant replacing the two `partition_point` calls with an explicit scan,
+because the resulting sequence `[size 1][size >= 2][empty]` is not monotone for either predicate.
+It is a pure relabelling — same bins, same contents, same sequences — so nothing downstream
+changes. `code/templates/fast_construct_binning_core.tpp` and the matching `fallback_layout` in
+`code/templates/fast_construct_generate_hibf.tpp`.
+
+| | declared tbins | empty | allocated (64-padded) |
+|---|---:|---:|---:|
+| RefSeq, before | 170 688 | 41 949 (25%) | 170 688 |
+| RefSeq, after  | 128 739 | **0** | **145 792** (-15%) |
+
+Every dataset now reports `empty_tbins=0`, all layouts still validate, and every lower level IBF
+count is unchanged (1024 -> 16 ... 524288 -> 785, RefSeq -> 889). RefSeq runtime is unchanged.
+
+### What is left, and why it was not pursued
+
+The residual 12% on RefSeq is the 64-block rounding, not empty bins: an IBF using 100 bins still
+allocates 128. Measurements on whether that can be reclaimed:
+
+* **More refinement steps do not help.** `p=12` instead of `5` leaves the waste at 12% and
+  doubles the runtime (303 s vs 143 s). The `t_max` bisection already sits at the overflow
+  boundary.
+* **The waste is thin and spread out**, not concentrated in a few IBFs:
+
+  | used bins | #IBFs | padding wasted |
+  |---|---:|---:|
+  | 1-64 | 36 | 157 |
+  | 65-128 | 317 | 7 507 |
+  | 129-192 | 536 | 9 389 |
+
+* **Best case if the spare bins were used**: a split bin's fill is exactly its sequence's sketch
+  size, so this can be computed directly from the sketch cache. Greedily handing every spare bin
+  to the currently fullest user bin, with fcorr applied, gives a **16.1%** smaller `bin_size`
+  across the 716 IBFs that could use it — mostly modest (302 IBFs under 10%, 295 between 10 and
+  20%).
+
+Reaching that needs two things the code does not have: an **fcorr-aware fill model**
+(`track_fill` holds raw content and `layout_cost` ignores fcorr, so the search cannot see the
+trade-off at all) and a **re-splitting pass** that preserves the contiguity invariant for split
+user bins — the same invariant behind two of the bugs fixed above. That is a new phase plus a
+changed size model, so it was left alone.
+
+### Avenues, roughly best effort to benefit first
+
+1. **Size `global_bins` per IBF instead of globally.** `get_sub_bins`
+   (`code/templates/fast_construct_generate_hibf.tpp`) hands every IBF at every level
+   `ceil(sqrt(N_total)/64)*64`; a child holding 133 sequences gets 192 bins. Sizing each IBF from
+   its own content removes most of the padding by construction, with no re-splitting — worth
+   about 12% of allocated bins. The merge bin occupancy cap is `bins`, so this changes tree shape
+   and needs full re-verification.
+2. **Charge allocated 64-blocks in `layout_cost`.** Written and measured: RefSeq drops from
+   145 792 to 126 144 allocated bins (waste 12% -> 7%), but lower level IBFs rise from 889 to
+   1059, and 524288 from 785 to 890. A one-line change, reverted, with the measurement recorded
+   in a comment at `code/templates/fast_construct_generate_hibf.tpp:38-43`. The cheapest lever if
+   the extra IBFs turn out not to matter; a real `raptor build` size comparison would settle it.
+3. **Greedy re-split post-pass.** **Done** — see *Spending the spare bins* below. It turned out
+   not to need the fcorr-aware model; adding one made the result worse.
+4. **Accept it.** 12% of allocated technical bins on RefSeq, 0-4% on the simulated data.
+
+## Spending the spare bins: the greedy re-split pass
+
+The packing above removed every *declared* empty bin, but the 64-block rounding still left RefSeq
+allocating 145 792 technical bins for 128 739 used ones. This pass spends that difference.
+
+### What it does
+
+After all placement, before the final sort
+(`code/templates/fast_construct_binning_core.tpp`, 65 lines):
+
+```
+used   = non-empty bins
+target = min(bins, ceil(used / 64) * 64)      // what the HIBF allocates anyway
+spare  = target - used
+
+while spare > 0:
+    take the split user bin with the largest fcorrs[k] * (content / k)
+    stop if it is not larger than the fullest merge bin      (merge bins cannot be split)
+    stop if giving it one more bin does not lower its demand (fcorrs[k+1] outgrows the division)
+    give it a free bin, re-partition its content evenly over k+1 bins
+```
+
+Three properties make this cheap and safe:
+
+* **Merged bins are excluded** — splitting one would mean a new child IBF. The fullest merged bin
+  is therefore a floor on what the pass can achieve, and it stops there.
+* **No contiguity work is needed.** The final sort orders by `(size, front sequence)`, so the k+1
+  technical bins of a user bin end up adjacent by construction, which is what `record_bins`
+  needs.
+* **`bin_sketches` is not touched** — it is local to `binning_core` and dead after this point, so
+  only `res` and `track_fill` have to be updated.
+
+### Result
+
+Measured as `sum over IBFs of allocated_technical_bins * bin_size`, where a split user bin's
+demand is `fcorrs[k] * content / k` and a merged bin's is the union of its subtree (computed from
+the sketch cache):
+
+| RefSeq | IBFs | allocated tbins | estimated index size |
+|---|---:|---:|---:|
+| packing only | 889 | 145 792 | 100.0% |
+| **+ greedy re-split** | **883** | 153 216 | **89.8%** |
+
+A 10% smaller index, slightly *fewer* IBFs, runtime unchanged at ~141 s, padding waste 12% -> 1%.
+
+The ten simulated datasets are **bit-for-bit unchanged** — same lower level IBF counts, same
+estimated size (1024, 16384 and 524288 all measured at exactly 100.0%). That is the expected
+profile: the pass only fires where an IBF has both spare bins and split bins, and on that data
+the spare bins sit in IBFs whose bins are all merged (the 1024 root) or there are no spare bins
+at all.
+
+### One thing that looked right and was not
+
+Making `layout_cost` fcorr-aware — replacing the raw `max_fill` with
+`max over user bins of fcorrs[k] * (content / k)` — is the obvious companion change, since the
+cost model otherwise prices splitting as free. Measured, it makes things **worse**: 94.3% against
+the 89.8% of the pass alone, and the IBF count jumps from 883 to 1105. Reverted.
+
+The reason is that `sub_bins * max_demand` with an fcorr-inflated `max_demand` overstates the
+cost of the split-heavy layouts that the pass is designed to produce, so the `t_max` search
+retreats to layouts with more, smaller merged bins instead. A cost model that captures this
+properly would have to price the children it creates, not just their content.
+
+### A note on measuring this
+
+The first proxy used here summed `allocated_tbins * bin_size` over only those IBFs that have no
+merged bins, because a merged bin's demand needs the union of its whole subtree. That set of IBFs
+differs between layouts, so the sum was comparing different things and reported the pass as 10%
+*worse*. Computing the merged unions properly (numpy over the cached sketches) reversed the sign.
+Worth remembering before trusting any partial-subset comparison here.
+
 ## What is still open
 
 * **The two largest datasets keep a small third level** — 2 IBFs for 262144, 17 for 524288.
@@ -502,18 +658,16 @@ them got faster — 262144 went from 54 s to 33 s from cache, with fewer threads
   (`code/templates/fast_construct_generate_hibf.tpp:176`) headroom rather than deriving it from
   `ceil(sqrt(N)/64)*64` alone.
 * **1024 and 2048 use only 16 and 32 of their 64 top level technical bins.** One merge bin per
-  genome group is the natural clustering for this data, but `binning_core` sorts empty bins to
-  the *front*, so the IBF still allocates all 64 with 48 (resp. 32) of them empty — about 4% of
-  that layout's technical bins. Sorting empty bins last would drop them, but it breaks the
-  `partition_point` logic that derives `split_start` / `merge_start`, so the convention was left
-  alone. Note also that 16 is not obviously better than chopper's 64: fewer, fatter top level
-  bins may cost query time, so this wants benchmarking rather than assuming.
+  genome group is the natural clustering for this data. The bins are now packed, so nothing is
+  declared that is not used, but 16 still rounds up to one 64-block. Note also that 16 is not
+  obviously better than chopper's 64: fewer, fatter top level bins may cost query time, so this
+  wants benchmarking rather than assuming.
 * **`function_tests` reports 4 failures** — seeding-after-splitting, climbing, splitting, and
   merge/split isolation. These predate the fix: the test output is byte-identical to a build
   from before it (51 TRUE / 4 FALSE both ways).
-* **RefSeq keeps a third level too** (696 IBFs at level 2), and 41 949 of its 170 688 technical
-  bins are empty. That is the same `global_bins` sizing question as above, amplified by RefSeq's
-  7021 clusters competing for 192 top level bins.
+* **RefSeq keeps a third level too** (696 IBFs at level 2). That is the same `global_bins`
+  sizing question as above, amplified by RefSeq's 7021 clusters competing for 192 top level
+  bins.
 * **The root binning still dominates the RefSeq runtime** — about 150 s of the 158 s, six passes
   at roughly 20 s each, mostly in late merging and the fallback. The remaining cost is real work
   rather than waste, but sampling `t_max` more cheaply would cut it near-proportionally.

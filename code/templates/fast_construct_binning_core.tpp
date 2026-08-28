@@ -558,6 +558,71 @@ std::tuple<std::vector<std::vector<size_t>>, std::tuple<size_t,size_t,size_t>, s
     }
 
 
+    /// @note Spend the technical bins that are allocated but not used.
+    /// The HIBF rounds an IBF's technical bin count up to a multiple of 64 and sizes every bin by
+    /// the fullest one, so the bins between `used` and that multiple are already paid for. Giving
+    /// one of them to a split user bin divides that bin's content by (k+1)/k while its correction
+    /// factor only grows from fcorrs[k] to fcorrs[k+1], which is a net reduction of the size every
+    /// bin in this IBF has to be built at. Always feed the currently fullest one.
+    {
+        size_t used = 0;
+        std::vector<size_t> free_bins;
+        for (size_t b = 0; b < bins; b++) {
+            if (res[b].empty()) free_bins.push_back(b);
+            else used += 1;
+        }
+
+        size_t const target = std::min(bins, ((used + 63) / 64) * 64);
+        size_t spare = std::min((target > used) ? (target - used) : 0, free_bins.size());
+
+        if (spare > 0) {
+            // Merged bins cannot be split any further, so the fullest of them is a floor on what
+            // this pass can achieve.
+            size_t merge_floor = 0;
+            std::unordered_map<size_t, std::vector<size_t>> split_bins_of;
+            for (size_t b = 0; b < bins; b++) {
+                if (res[b].size() == 1) split_bins_of[res[b][0]].push_back(b);
+                else if (res[b].size() > 1) merge_floor = std::max(merge_floor, track_fill[b]);
+            }
+
+            auto content_of = [&](size_t seq) {
+                return static_cast<size_t>(static_cast<double>(fracmin_sketches[seq].size()) / s);
+            };
+            auto demand = [&](size_t seq, size_t k) {
+                size_t const per_bin = (content_of(seq) + k - 1) / k;
+                return static_cast<size_t>(static_cast<double>(per_bin) * fcorrs[k]);
+            };
+
+            std::priority_queue<std::pair<size_t, size_t>> fullest;   // (demand, seq)
+            for (const auto& [seq, group] : split_bins_of) fullest.push({demand(seq, group.size()), seq});
+
+            size_t next_free = 0;
+            while (spare > 0 && !fullest.empty()) {
+                auto [dem, seq] = fullest.top();
+                size_t const k = split_bins_of[seq].size();
+
+                // The queue is ordered by demand, so once the fullest user bin cannot be improved
+                // no other one can lower the maximum either.
+                if (dem <= merge_floor) break;
+                if (k + 1 >= fcorrs.size()) break;
+                if (k + 1 >= fracmin_sketches[seq].size()) break;
+                if (demand(seq, k + 1) >= dem) break;
+
+                fullest.pop();
+                size_t const b = free_bins[next_free++];
+                res[b].push_back(seq);
+                binned.insert(seq);
+                split_bins_of[seq].push_back(b);
+                spare -= 1;
+
+                size_t const per_bin = (content_of(seq) + k) / (k + 1);
+                for (size_t group_bin : split_bins_of[seq]) track_fill[group_bin] = per_bin;
+
+                fullest.push({demand(seq, k + 1), seq});
+            }
+        }
+    }
+
     /// @note This is preperation for what will be returned.
 
     // Pack the used bins to the front. The HIBF sizes an IBF from the highest technical bin index
